@@ -7,6 +7,7 @@
 //! every missing input skips the tick, the gate owns approval, and execution
 //! still requires the operator switch plus the terminal's own arming.
 //!
+//! Trades gold (`XAUUSD`) unless other instruments are configured.
 //! On by default until switched off (`VEYRA_AUTOPILOT_ENABLED=false`, or the
 //! console's autopilot switch, which survives restarts). It only proposes:
 //! orders still need the service's execution switch and the terminal's own
@@ -62,6 +63,8 @@ use crate::trading::contract;
 use crate::trading::intent::TradeIntentDraft;
 use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
+/// Instrument the autopilot trades when none is configured: gold against USD.
+const DEFAULT_SYMBOL: &str = "XAUUSD";
 /// Default proposal cadence in seconds.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// Largest number of instruments one autopilot rotation accepts.
@@ -269,7 +272,13 @@ impl AutopilotSettings {
                 }
             })?]
         } else {
-            Vec::new()
+            // Gold against the dollar unless the operator picks other pairs.
+            vec![Symbol::parse(DEFAULT_SYMBOL).map_err(|_| {
+                ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_SYMBOL",
+                    reason: "built-in default symbol is invalid",
+                }
+            })?]
         };
         let timeframe = match timeframe_raw.as_str() {
             "" => Timeframe::H4,
@@ -4266,6 +4275,7 @@ mod tests {
     fn enabled_settings() -> AutopilotSettings {
         settings_from(|name| match name {
             "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOL" => Ok("EURUSD".to_owned()),
             _ => Err(ConfigError::MissingEnvironmentVariable { name }),
         })
     }
@@ -4475,7 +4485,15 @@ mod tests {
         assert_eq!(defaults.breakeven_r(), 0.0, "break-even is opt-in");
         assert_eq!(defaults.trail_r(), 0.0, "trailing is opt-in");
         assert!(defaults.profit_harvest().is_none(), "harvesting is opt-in");
-        assert!(defaults.symbols().is_empty());
+        assert_eq!(
+            defaults
+                .symbols()
+                .iter()
+                .map(Symbol::as_str)
+                .collect::<Vec<_>>(),
+            ["XAUUSD"],
+            "gold against USD is the default pair"
+        );
 
         let custom = settings_from(|name| match name {
             "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),

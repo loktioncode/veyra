@@ -114,7 +114,7 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_AUTOPILOT_ENABLED:
     'Runs the autonomous loop: each cycle it reviews open positions and may propose one trade, which the risk policy must approve.',
   VEYRA_AUTOPILOT_SYMBOL:
-    "The one instrument the autopilot trades; empty uses the terminal's chart symbol. Leave empty when Symbols is set.",
+    'The one instrument the autopilot trades; empty means XAUUSD (gold). Leave empty when Symbols is set.',
   VEYRA_AUTOPILOT_SYMBOLS:
     "Instruments the autopilot chooses from, up to 16, one trade per cycle. Each must also be on the risk gate's allowed list.",
   VEYRA_AUTOPILOT_TIMEFRAME:
