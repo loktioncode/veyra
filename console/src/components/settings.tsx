@@ -237,7 +237,7 @@ const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN1'].map
 
 const SETTING_KINDS: Record<string, SettingKind> = {
   VEYRA_TRADING_ENABLED: { kind: 'switch', fallback: false },
-  VEYRA_AUTOPILOT_ENABLED: { kind: 'switch', fallback: false },
+  VEYRA_AUTOPILOT_ENABLED: { kind: 'switch', fallback: true },
   VEYRA_AUTOPILOT_PROFIT_HARVEST: { kind: 'switch', fallback: false },
   VEYRA_MODEL_COMPEL_STRUCTURED: { kind: 'switch', fallback: true },
   VEYRA_MODEL_PREFER_SUBSCRIPTION: { kind: 'switch', fallback: true },

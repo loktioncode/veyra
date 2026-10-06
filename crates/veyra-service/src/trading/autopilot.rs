@@ -7,7 +7,10 @@
 //! every missing input skips the tick, the gate owns approval, and execution
 //! still requires the operator switch plus the terminal's own arming.
 //!
-//! Disabled by default (`VEYRA_AUTOPILOT_ENABLED`). The supervised process
+//! On by default until switched off (`VEYRA_AUTOPILOT_ENABLED=false`, or the
+//! console's autopilot switch, which survives restarts). It only proposes:
+//! orders still need the service's execution switch and the terminal's own
+//! arming, so with those off every approved entry is a recorded dry run. The supervised process
 //! runs the first tick one interval after startup, so a restart never fires
 //! immediately. Every autonomous entry must carry both a stop loss and a take
 //! profit; an unbracketed proposal is rejected before the command layer sees
@@ -208,8 +211,9 @@ impl AutopilotSettings {
         })
     }
 
-    /// Parses an injected settings source. Absent variables default and
-    /// disable the loop; any present variable is validated strictly.
+    /// Parses an injected settings source. Absent variables take their
+    /// defaults, which leave the loop on; any present variable is validated
+    /// strictly.
     ///
     /// # Errors
     /// Returns [`ConfigError`] when a present value is malformed.
@@ -238,33 +242,10 @@ impl AutopilotSettings {
         let harvest_reentry_raw =
             optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_REENTRY_COOLDOWN_SECS");
 
-        if enabled_raw.is_empty()
-            && symbol_raw.is_empty()
-            && symbols_raw.is_empty()
-            && timeframe_raw.is_empty()
-            && bars_raw.is_empty()
-            && tier_raw.is_empty()
-            && interval_raw.is_empty()
-            && jev_raw.is_empty()
-            && min_hold_raw.is_empty()
-            && breakeven_raw.is_empty()
-            && trail_raw.is_empty()
-            && entry_move_raw.is_empty()
-            && entry_recheck_raw.is_empty()
-            && harvest_enabled_raw.is_empty()
-            && harvest_arm_raw.is_empty()
-            && harvest_trail_raw.is_empty()
-            && harvest_min_profit_raw.is_empty()
-            && harvest_giveback_raw.is_empty()
-            && harvest_min_hold_raw.is_empty()
-            && harvest_reentry_raw.is_empty()
-        {
-            return Ok(None);
-        }
-
         let enabled = match enabled_raw.as_str() {
-            "" | "false" => false,
-            "true" => true,
+            // On unless someone turns it off: an unset value is not a refusal.
+            "" | "true" => true,
+            "false" => false,
             _ => {
                 return Err(ConfigError::InvalidEnvironmentVariable {
                     name: "VEYRA_AUTOPILOT_ENABLED",
@@ -4471,8 +4452,9 @@ mod tests {
         let absent = AutopilotSettings::from_source(|name| {
             Err(ConfigError::MissingEnvironmentVariable { name })
         })
-        .expect("absent settings parse");
-        assert!(absent.is_none());
+        .expect("absent settings parse")
+        .expect("autopilot is configured by default");
+        assert!(absent.enabled(), "autopilot is on until turned off");
 
         let defaults = settings_from(|name| match name {
             "VEYRA_AUTOPILOT_ENABLED" => Ok("false".to_owned()),
