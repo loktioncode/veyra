@@ -217,3 +217,96 @@ export function activityTone(event: FeedEvent): 'ok' | 'warn' | 'bad' | 'idle' {
   if (outcome === 'held' || outcome === 'close_queued') return 'warn'
   return 'ok'
 }
+
+/* ---------- judgements ---------- */
+
+/** One pair's Jev read, reduced to the three questions the autopilot asks. */
+export type PairRead = { symbol: string; direction?: string; confidence?: number; trending?: number; momentum?: string }
+
+/** One model verdict, as the Judgements tab lists it. */
+export type Judgement = {
+  seq: number
+  at_ms: number
+  /** What the verdict was about: one pair, or the whole selected menu. */
+  scope: string
+  /** What was decided, e.g. `No trade`, `Trade queued`, `Trade held`. */
+  conclusion: string
+  tone: 'ok' | 'warn' | 'bad' | 'idle'
+  /** The model's own reasoning, or the refusal code when it gave none. */
+  reasoning?: string
+  /** Where it came from: an entry sweep, or a review of an open position. */
+  source: 'Entry sweep' | 'Position review' | 'Weekend review'
+  reads: PairRead[]
+}
+
+const VERDICTS = new Set([
+  'no_trade',
+  'held',
+  'queued',
+  'approved_dry_run',
+  'rejected',
+  'unavailable',
+  'close_queued',
+  'close_rejected',
+])
+
+const SOURCES: Record<string, Judgement['source']> = {
+  autopilot: 'Entry sweep',
+  autopilot_review: 'Position review',
+  autopilot_weekend: 'Weekend review',
+}
+
+function readOf(symbol: string, judgement: unknown): PairRead | undefined {
+  if (!judgement || typeof judgement !== 'object') return undefined
+  const answers = judgement as Record<string, Record<string, unknown> | undefined>
+  const direction = answers.direction
+  const read: PairRead = { symbol }
+  if (typeof direction?.choice === 'string') read.direction = direction.choice
+  if (typeof direction?.confidence === 'number') read.confidence = direction.confidence
+  if (typeof answers.trending?.probability === 'number') read.trending = answers.trending.probability
+  const legend = answers.momentum?.legend
+  if (typeof legend === 'string') read.momentum = legend
+  return read
+}
+
+/**
+ * The model's verdicts, newest first: every entry sweep and position review
+ * that reached (or failed to reach) a conclusion. Deterministic stop moves
+ * and harvests are left out; they follow rules, not a judgement.
+ */
+export function judgements(events: ReadonlyArray<FeedEvent>): Judgement[] {
+  const rows: Judgement[] = []
+  for (const event of events) {
+    if (event.kind !== 'proposal_evaluated') continue
+    const payload = event.payload ?? {}
+    const outcome = typeof payload.outcome === 'string' ? payload.outcome : ''
+    const source = typeof payload.origin === 'string' ? SOURCES[payload.origin] : undefined
+    if (!source || !VERDICTS.has(outcome)) continue
+    const symbol = typeof payload.symbol === 'string' ? payload.symbol : undefined
+    const reads: PairRead[] = []
+    if (Array.isArray(payload.menu)) {
+      for (const entry of payload.menu as Array<Record<string, unknown>>) {
+        const name = typeof entry?.symbol === 'string' ? entry.symbol : undefined
+        const read = name ? readOf(name, entry.judgement) : undefined
+        if (read) reads.push(read)
+      }
+    } else if (symbol) {
+      const read = readOf(symbol, payload.judgements)
+      if (read) reads.push(read)
+    }
+    const menu = Array.isArray(payload.menu) ? (payload.menu as Array<{ symbol?: unknown }>) : []
+    const reasoning =
+      typeof payload.rationale === 'string' ? payload.rationale : typeof payload.reason === 'string' ? payload.reason : undefined
+    rows.push({
+      seq: event.seq,
+      at_ms: event.at_ms,
+      scope: symbol ?? (menu.length > 0 ? menu.map((entry) => String(entry.symbol)).join(', ') : 'Selected pairs'),
+      conclusion: activityTitle(event),
+      tone: activityTone(event),
+      reasoning,
+      source,
+      reads,
+    })
+  }
+  return rows.sort((a, b) => b.at_ms - a.at_ms || b.seq - a.seq)
+}

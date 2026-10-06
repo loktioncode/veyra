@@ -38,6 +38,7 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
       'VEYRA_AUTOPILOT_JEV',
       'VEYRA_AUTOPILOT_MIN_HOLD_SECS',
       'VEYRA_AUTOPILOT_ENTRY_MOVE_ATR',
+      'VEYRA_AUTOPILOT_ENTRY_RECHECK_SECS',
       'VEYRA_AUTOPILOT_BREAKEVEN_R',
       'VEYRA_AUTOPILOT_TRAIL_R',
     ],
@@ -122,7 +123,9 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_AUTOPILOT_TIER:
     'Model tier that proposes and reviews trades: Fast is the cheapest, Reasoning the strongest. Defaults to Balanced.',
   VEYRA_AUTOPILOT_INTERVAL_SECS:
-    'Seconds between autopilot cycles, 30–86400; empty means 300. Stop and profit checks run on the same cadence.',
+    'How often the autopilot wakes to check the market, stops and profit; empty means every 5 minutes.',
+  VEYRA_AUTOPILOT_ENTRY_RECHECK_SECS:
+    'Longest gap before every selected pair is judged for entry again, even with no new candle; empty means 15 minutes.',
   VEYRA_AUTOPILOT_JEV:
     'Auto asks the Jev judgement service for direction, trend and momentum reads when it is set up; Off never asks.',
   VEYRA_AUTOPILOT_MIN_HOLD_SECS:
@@ -207,6 +210,29 @@ type SettingKind =
   /** A comma-separated list of broker instruments, chosen from the broker's own list. */
   | { kind: 'symbols'; fallback: string }
 
+const MINUTE = 60
+const intervalOption = (secs: number, label: string) => ({ value: String(secs), label })
+
+const CHECK_INTERVALS = [
+  intervalOption(MINUTE, 'Every minute'),
+  intervalOption(2 * MINUTE, 'Every 2 minutes'),
+  intervalOption(5 * MINUTE, 'Every 5 minutes'),
+  intervalOption(10 * MINUTE, 'Every 10 minutes'),
+  intervalOption(15 * MINUTE, 'Every 15 minutes'),
+  intervalOption(30 * MINUTE, 'Every 30 minutes'),
+  intervalOption(60 * MINUTE, 'Every hour'),
+]
+
+const ENTRY_RECHECKS = [
+  intervalOption(0, 'Off · new candles only'),
+  intervalOption(5 * MINUTE, 'Every 5 minutes'),
+  intervalOption(10 * MINUTE, 'Every 10 minutes'),
+  intervalOption(15 * MINUTE, 'Every 15 minutes'),
+  intervalOption(30 * MINUTE, 'Every 30 minutes'),
+  intervalOption(60 * MINUTE, 'Every hour'),
+  intervalOption(240 * MINUTE, 'Every 4 hours'),
+]
+
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4', 'D1', 'W1', 'MN1'].map((value) => ({ value, label: value }))
 
 const SETTING_KINDS: Record<string, SettingKind> = {
@@ -217,6 +243,8 @@ const SETTING_KINDS: Record<string, SettingKind> = {
   VEYRA_MODEL_PREFER_SUBSCRIPTION: { kind: 'switch', fallback: true },
   VEYRA_MODEL_APP_HIDDEN: { kind: 'switch', fallback: false },
   VEYRA_AUTOPILOT_TIMEFRAME: { kind: 'choice', fallback: 'H4', options: TIMEFRAMES },
+  VEYRA_AUTOPILOT_INTERVAL_SECS: { kind: 'choice', fallback: '300', options: CHECK_INTERVALS },
+  VEYRA_AUTOPILOT_ENTRY_RECHECK_SECS: { kind: 'choice', fallback: '900', options: ENTRY_RECHECKS },
   VEYRA_AUTOPILOT_TIER: {
     kind: 'choice',
     fallback: 'balanced',

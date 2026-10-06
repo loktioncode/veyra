@@ -201,6 +201,12 @@
   white-space: nowrap;
 }
 
+.tab-event-line.is-wrap {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+
 .tab-event-line.mono {
   font-size: 12px;
 }

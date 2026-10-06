@@ -99,6 +99,13 @@ const DEFAULT_HARVEST_MIN_HOLD_SECS: u64 = 300;
 const DEFAULT_HARVEST_REENTRY_COOLDOWN_SECS: u64 = 900;
 /// Largest minimum-hold window the parser accepts.
 const MAX_MIN_HOLD_SECS: u64 = 86_400;
+/// Default longest quiet spell before every selected pair is judged again.
+const DEFAULT_ENTRY_RECHECK_SECS: u64 = 900;
+/// Largest entry re-check window the parser accepts.
+const MAX_ENTRY_RECHECK_SECS: u64 = 86_400;
+/// Slack so a tick that lands a moment early still counts as due; the ticks
+/// run on a fixed cadence while the last sweep is stamped after its own work.
+const ENTRY_RECHECK_JITTER_SECS: i64 = 60;
 
 /// Validated deterministic policy for banking profit before the original take
 /// profit while preventing immediate same-signal re-entry.
@@ -186,6 +193,7 @@ pub struct AutopilotSettings {
     breakeven_r: f64,
     trail_r: f64,
     entry_move_atr_fraction: f64,
+    entry_recheck: Duration,
     profit_harvest: Option<ProfitHarvestPolicy>,
 }
 
@@ -220,6 +228,7 @@ impl AutopilotSettings {
         let breakeven_raw = optional(&mut source, "VEYRA_AUTOPILOT_BREAKEVEN_R");
         let trail_raw = optional(&mut source, "VEYRA_AUTOPILOT_TRAIL_R");
         let entry_move_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENTRY_MOVE_ATR");
+        let entry_recheck_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENTRY_RECHECK_SECS");
         let harvest_enabled_raw = optional(&mut source, "VEYRA_AUTOPILOT_PROFIT_HARVEST");
         let harvest_arm_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_ARM_R");
         let harvest_trail_raw = optional(&mut source, "VEYRA_AUTOPILOT_HARVEST_TRAIL_R");
@@ -241,6 +250,7 @@ impl AutopilotSettings {
             && breakeven_raw.is_empty()
             && trail_raw.is_empty()
             && entry_move_raw.is_empty()
+            && entry_recheck_raw.is_empty()
             && harvest_enabled_raw.is_empty()
             && harvest_arm_raw.is_empty()
             && harvest_trail_raw.is_empty()
@@ -495,6 +505,21 @@ impl AutopilotSettings {
             None
         };
 
+        let entry_recheck = match entry_recheck_raw.as_str() {
+            "" => Duration::from_secs(DEFAULT_ENTRY_RECHECK_SECS),
+            other => {
+                let invalid = || ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_ENTRY_RECHECK_SECS",
+                    reason: "must be an integer number of seconds from 0 through 86400",
+                };
+                let secs = other.parse::<u64>().map_err(|_| invalid())?;
+                if secs > MAX_ENTRY_RECHECK_SECS {
+                    return Err(invalid());
+                }
+                Duration::from_secs(secs)
+            }
+        };
+
         Ok(Some(Self {
             enabled,
             symbols,
@@ -507,6 +532,7 @@ impl AutopilotSettings {
             breakeven_r,
             trail_r,
             entry_move_atr_fraction,
+            entry_recheck,
             profit_harvest,
         }))
     }
@@ -564,6 +590,13 @@ impl AutopilotSettings {
     /// sweep asks the model again; zero leaves new candles as the only trigger.
     pub fn entry_move_atr_fraction(&self) -> f64 {
         self.entry_move_atr_fraction
+    }
+
+    /// Longest quiet spell before every selected pair is judged again even
+    /// though no candle closed and no price moved far. Zero leaves entries to
+    /// the candle and move triggers alone.
+    pub fn entry_recheck(&self) -> Duration {
+        self.entry_recheck
     }
 
     /// Distance kept behind the best favourable price once trailing starts,
@@ -1024,7 +1057,10 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         &observations,
         settings.entry_move_atr_fraction(),
         unix_secs(state.now()),
-    ) {
+    ) && !state
+        .entry_watch()
+        .recheck_due(settings.entry_recheck(), unix_secs(state.now()))
+    {
         // Nothing moved since the last proposal, so the model would be asked
         // an identical question. Stops and reviews already ran above.
         TickOutcome::Unchanged
@@ -1035,6 +1071,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             empty_entry_reason(&markets, &policy, state.now())
         };
         state.entry_watch().record(&observations);
+        state.entry_watch().stamp_sweep(unix_secs(state.now()));
         record(state, "no_trade", None, None, Some(reason)).await;
         TickOutcome::NoTrade
     } else {
@@ -1044,6 +1081,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         // A sweep that dies before a verdict arms a retry instead (see
         // `mark_failed`), so the mark costs minutes rather than the candle.
         state.entry_watch().record(&observations);
+        state.entry_watch().stamp_sweep(unix_secs(state.now()));
         // Scheduled news: a configured calendar that cannot answer aborts the
         // entry sweep; trading blind through a data outage is exactly what the
         // blackout exists to prevent.
@@ -1106,6 +1144,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                     .map(|tool| tool.name.clone())
                     .collect();
                 let rationale = evaluation.rationale.as_deref();
+                let menu = judged_menu(&entry_markets, &judgements);
                 match evaluation.outcome {
                     PipelineOutcome::NoTrade => {
                         record_event_context(
@@ -1120,6 +1159,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                                 rationale,
                                 judgements: None,
                                 tool_names: Some(&tool_names),
+                                menu: Some(&menu),
                             },
                         )
                         .await;
@@ -1139,6 +1179,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                                 rationale,
                                 judgements: judgement_for_symbol(&judgements, symbol.as_str()),
                                 tool_names: Some(&tool_names),
+                                menu: Some(&menu),
                             },
                         )
                         .await;
@@ -1153,6 +1194,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                             rationale,
                             judgements: judgement_for_symbol(&judgements, symbol.as_str()),
                             tool_names: Some(&tool_names),
+                            menu: Some(&menu),
                         };
                         if draft.stop_loss().is_none() || draft.take_profit().is_none() {
                             record_event_context(
@@ -1705,6 +1747,22 @@ fn symbol_spec_for<'a>(
         .map(|(_, spec)| spec)
 }
 
+/// The instruments one entry sweep weighed, each with the judge's read of it
+/// (null when no judge answered), journaled beside the verdict.
+fn judged_menu(markets: &[(Symbol, CandleSeries)], judgements: &[(Symbol, Value)]) -> Value {
+    Value::Array(
+        markets
+            .iter()
+            .map(|(symbol, _)| {
+                json!({
+                    "symbol": symbol.as_str(),
+                    "judgement": judgement_for_symbol(judgements, symbol.as_str())
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Judgement summary for one symbol, when the judge produced one.
 fn judgement_for_symbol<'a>(judgements: &'a [(Symbol, Value)], symbol: &str) -> Option<&'a Value> {
     judgements
@@ -2232,6 +2290,9 @@ pub struct EntryWatch {
     /// outage re-asks every [`ENTRY_RETRY_AFTER_SECS`], not every tick) while
     /// bounding what a single failure costs.
     failed_at: std::sync::Mutex<Option<i64>>,
+    /// When the menu was last judged, whatever the verdict. Drives the timed
+    /// re-check so a quiet chart is still looked at on a fixed cadence.
+    last_sweep: std::sync::Mutex<Option<i64>>,
 }
 
 /// How long a failed entry sweep holds the gate before it is asked again.
@@ -2400,6 +2461,34 @@ impl EntryWatch {
             };
             fraction > 0.0 && atr > 0.0 && (now - before).abs() >= atr * fraction
         })
+    }
+
+    /// Whether the menu has gone `recheck` without being judged.
+    ///
+    /// Candle and move triggers say the market changed; this one says time
+    /// passed. A never-judged menu is not due here: the ordinary gate already
+    /// opens for an instrument it has not seen. Zero disables the timed pass.
+    pub fn recheck_due(&self, recheck: Duration, now: i64) -> bool {
+        if recheck.is_zero() {
+            return false;
+        }
+        let Ok(last) = self.last_sweep.lock() else {
+            // A poisoned lock must not silently stop trading; ask instead.
+            return true;
+        };
+        let window = i64::try_from(recheck.as_secs()).unwrap_or(i64::MAX);
+        last.is_some_and(|at| {
+            now.saturating_sub(at)
+                .saturating_add(ENTRY_RECHECK_JITTER_SECS)
+                >= window
+        })
+    }
+
+    /// Notes that the menu was judged at `now`, restarting the re-check clock.
+    pub fn stamp_sweep(&self, now: i64) {
+        if let Ok(mut last) = self.last_sweep.lock() {
+            *last = Some(now);
+        }
     }
 
     /// Records the market each instrument was judged on.
@@ -2883,6 +2972,7 @@ async fn review_positions(
         rationale: outcome.rationale.as_deref(),
         judgements,
         tool_names: Some(&tool_names),
+        menu: None,
     };
     let decision = match outcome.decision {
         AgentDecision::Review(decision) => decision,
@@ -3368,6 +3458,9 @@ struct DecisionContext<'a> {
     judgements: Option<&'a Value>,
     /// Read-only agent tools used before this decision, in call order.
     tool_names: Option<&'a [String]>,
+    /// Every instrument the sweep put in front of the model with the judge's
+    /// read of each, so a no-trade verdict still shows what was weighed.
+    menu: Option<&'a Value>,
 }
 
 /// Records one review decision with the model's rationale and judgements.
@@ -3484,6 +3577,9 @@ async fn record_symbol_event_context(
     }
     if let Some(judgements) = context.judgements {
         payload["judgements"] = judgements.clone();
+    }
+    if let Some(menu) = context.menu {
+        payload["menu"] = menu.clone();
     }
     if let Some(names) = context.tool_names
         && !names.is_empty()
@@ -4389,6 +4485,11 @@ mod tests {
         assert_eq!(defaults.interval(), Duration::from_secs(300));
         assert_eq!(defaults.jev(), JevPreference::Auto);
         assert_eq!(defaults.min_hold(), Duration::from_secs(300));
+        assert_eq!(
+            defaults.entry_recheck(),
+            Duration::from_secs(900),
+            "every selected pair is judged at least every 15 minutes"
+        );
         assert_eq!(defaults.breakeven_r(), 0.0, "break-even is opt-in");
         assert_eq!(defaults.trail_r(), 0.0, "trailing is opt-in");
         assert!(defaults.profit_harvest().is_none(), "harvesting is opt-in");
@@ -5608,6 +5709,36 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_quiet_chart_is_rejudged_once_the_recheck_window_lapses() {
+        let engine = StubEngine::answering(json!({"action": "none", "rationale": "ranging"}));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert_eq!(tick(&harness.state).await, TickOutcome::Unchanged);
+        assert_eq!(engine.requests().len(), 1);
+
+        // Same candles, same price, but the last sweep is now long past.
+        harness.state.entry_watch().stamp_sweep(1);
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        assert_eq!(
+            engine.requests().len(),
+            2,
+            "a lapsed re-check window must buy a fresh judgement"
+        );
+    }
+
+    #[actix_web::test]
     async fn a_new_candle_reopens_the_entry_question() {
         let engine = StubEngine::answering(json!({"action": "none"}));
         let harness = build_harness(
@@ -5643,6 +5774,58 @@ mod tests {
 
     /// Wall clock for gate tests that are not about the retry window.
     const GATE_NOW: i64 = 1_700_000_000;
+
+    /// A quiet chart is still judged on a fixed cadence, not only per candle.
+    #[test]
+    fn a_quiet_menu_is_rejudged_once_the_recheck_window_passes() {
+        let watch = EntryWatch::default();
+        let window = Duration::from_secs(900);
+
+        assert!(
+            !watch.recheck_due(window, GATE_NOW),
+            "a menu never judged is the ordinary gate's business"
+        );
+        watch.stamp_sweep(GATE_NOW);
+        assert!(!watch.recheck_due(window, GATE_NOW + 1));
+        assert!(
+            !watch.recheck_due(window, GATE_NOW + 800),
+            "the window must hold between sweeps"
+        );
+        assert!(
+            watch.recheck_due(window, GATE_NOW + 900),
+            "15 minutes on, the menu is judged again"
+        );
+        assert!(
+            watch.recheck_due(window, GATE_NOW + 845),
+            "a tick landing a little early still counts"
+        );
+
+        watch.stamp_sweep(GATE_NOW + 900);
+        assert!(
+            !watch.recheck_due(window, GATE_NOW + 901),
+            "a sweep restarts the clock"
+        );
+        assert!(
+            !watch.recheck_due(Duration::ZERO, GATE_NOW + 100_000),
+            "zero turns the timed pass off"
+        );
+    }
+
+    #[test]
+    fn the_entry_recheck_window_is_parsed_strictly() {
+        let with = |value: &'static str| {
+            AutopilotSettings::from_source(|name| match name {
+                "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+                "VEYRA_AUTOPILOT_ENTRY_RECHECK_SECS" => Ok(value.to_owned()),
+                _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+            })
+        };
+        let parsed = with("600").unwrap().unwrap();
+        assert_eq!(parsed.entry_recheck(), Duration::from_secs(600));
+        assert_eq!(with("0").unwrap().unwrap().entry_recheck(), Duration::ZERO);
+        assert!(with("soon").is_err());
+        assert!(with("86401").is_err());
+    }
 
     /// A sweep that dies before a verdict must not hold the gate for the candle.
     ///

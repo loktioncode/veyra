@@ -16,9 +16,11 @@ import { NotificationsPanel } from './notifications'
 import { LiveSettingsPanel } from './settings'
 import { Sidebar, Topbar, type NavTab } from './shell'
 import { TradesPanel, type TradesRange } from './trades'
+import { Segmented } from './ui'
 import {
   AccountPanel,
   ActivityFeed,
+  JudgementsPanel,
   AutopilotPanel,
   CommandsPanel,
   LogsPanel,
@@ -58,8 +60,9 @@ export function Dashboard() {
   // Conditions change on the scale of minutes (a session closing, a breaker
   // tripping); the banner reads them on every tab.
   const { data: advisories, error: advisoriesError } = usePoll(api.advisories, 30000)
-  const { events, notable, connected, settled } = useEventFeed(200)
+  const { events, notable, connected, settled } = useEventFeed(500)
   const [focus, setFocus] = useState(true)
+  const [activityView, setActivityView] = useState<'events' | 'judgements'>('events')
   const [logLevel, setLogLevel] = useState<LogLevel>('info')
   const { logs, error: logsError } = useLogFeed(logLevel)
   const { data: audit, error: auditError } = usePoll(() => api.audit(200), 15000)
@@ -272,9 +275,24 @@ export function Dashboard() {
           ) : null}
 
           {tab === 'activity' ? (
-            <div className="tab-grid">
-              <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
-              <CommandsPanel commands={commands?.commands} />
+            <div className="tab-stack">
+              <Segmented
+                label="Activity view"
+                options={[
+                  { value: 'events', label: 'Events' },
+                  { value: 'judgements', label: 'Judgements' },
+                ]}
+                value={activityView}
+                onChange={(value) => setActivityView(value === 'judgements' ? 'judgements' : 'events')}
+              />
+              {activityView === 'judgements' ? (
+                <JudgementsPanel events={events} connected={connected} />
+              ) : (
+                <div className="tab-grid">
+                  <ActivityFeed events={events} connected={connected} focus={focus} onFocusChange={setFocus} />
+                  <CommandsPanel commands={commands?.commands} />
+                </div>
+              )}
             </div>
           ) : null}
 

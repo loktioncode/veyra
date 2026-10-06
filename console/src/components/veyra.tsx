@@ -9,7 +9,7 @@
  * class names.
  */
 
-import { useId, useState } from 'react'
+import { useId, useMemo, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
 
 import type {
@@ -37,9 +37,11 @@ import {
   amount,
   detailRows,
   isRoutine,
+  judgements,
   payloadSummary,
   percent,
   signedAmount,
+  type PairRead,
 } from '../lib/format'
 import { auditTimeMs, clockTime, relativeTime, usePaged } from '../lib/hooks'
 import { Button, Control, SkeletonRows, TextControl } from './form'
@@ -1389,6 +1391,90 @@ export function ActivityFeed({
                   </span>
                 </button>
                 {expanded ? <EventDetail event={event} /> : null}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      <ListPager paged={paged} />
+    </Panel>
+  )
+}
+
+/* ---------- judgements ---------- */
+
+/** One pair's Jev read as a short line: `long · 72% · trending 64% · Strong`. */
+function readLine(read: PairRead): string {
+  const parts: string[] = []
+  if (read.direction) parts.push(read.confidence === undefined ? read.direction : `${read.direction} · ${Math.round(read.confidence * 100)}%`)
+  if (read.trending !== undefined) parts.push(`trending ${Math.round(read.trending * 100)}%`)
+  if (read.momentum) parts.push(`momentum ${read.momentum}`)
+  return parts.join(' · ') || 'No judgement'
+}
+
+/**
+ * What the autopilot thought and concluded, every time it looked: the model's
+ * reasoning for each entry sweep and position review, with the per-pair Jev
+ * reads it weighed. A "no trade" is listed too: it is the answer on most
+ * checks, and the reason is the useful part.
+ */
+export function JudgementsPanel({ events, connected }: { events: FeedEvent[]; connected: boolean }) {
+  const [selectedSeq, setSelectedSeq] = useState<number | undefined>(undefined)
+  const rows = useMemo(() => judgements(events), [events])
+  const paged = usePaged(rows, 10)
+
+  return (
+    <Panel
+      title="Judgements"
+      count={rows.length}
+      className="tab-panel"
+      actions={connected ? <State tone="ok">Streaming</State> : <State tone="idle">Connecting</State>}
+    >
+      {rows.length === 0 ? (
+        <Empty>{connected ? 'No judgements yet. The autopilot records one each time it checks.' : 'Connecting'}</Empty>
+      ) : (
+        <ul className="tab-list">
+          {paged.items.map((row) => {
+            const expanded = row.seq === selectedSeq
+            return (
+              <li key={row.seq} className="tab-row">
+                <button
+                  type="button"
+                  onClick={() => setSelectedSeq(expanded ? undefined : row.seq)}
+                  aria-expanded={expanded}
+                  className="tab-row-button tab-event"
+                >
+                  <time className="tab-time readout" dateTime={isoTime(row.at_ms)}>
+                    {clockTime(row.at_ms)}
+                  </time>
+                  <Dot tone={row.tone} />
+                  <span className="tab-event-text">
+                    <span className="tab-event-title">
+                      {row.conclusion} · {row.scope}
+                    </span>
+                    {row.reasoning ? <span className="tab-event-line is-wrap">{row.reasoning}</span> : null}
+                  </span>
+                </button>
+                {expanded ? (
+                  <div className="tab-detail">
+                    <div className="tab-detail-meta">
+                      <span>{row.source}</span>
+                      <span>{relativeTime(row.at_ms)}</span>
+                    </div>
+                    {row.reads.length > 0 ? (
+                      <dl className="tab-detail-rows">
+                        {row.reads.map((read) => (
+                          <div key={read.symbol}>
+                            <dt>{read.symbol}</dt>
+                            <dd>{readLine(read)}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    ) : (
+                      <p className="tab-group-note">No Jev reads were attached to this verdict.</p>
+                    )}
+                  </div>
+                ) : null}
               </li>
             )
           })}

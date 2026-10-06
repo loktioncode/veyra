@@ -15,6 +15,7 @@ import {
   detailRows,
   isNotable,
   isRoutine,
+  judgements,
   payloadSummary,
   percent,
   signedAmount,
@@ -291,5 +292,36 @@ describe('activityTone', () => {
     expect(activityTone(event('proposal_evaluated', { outcome: 'queued' }))).toBe('ok')
     expect(activityTone(event('position_closed', {}))).toBe('ok')
     expect(activityTone(event('proposal_evaluated', { outcome: 3 }))).toBe('ok')
+  })
+})
+
+describe('judgements', () => {
+  it('lists model verdicts with the per-pair reads, newest first, and skips rule-based moves', () => {
+    const sweep = {
+      outcome: 'no_trade',
+      origin: 'autopilot',
+      rationale: 'EURUSD is ranging; no edge.',
+      menu: [
+        {
+          symbol: 'EURUSD',
+          judgement: {
+            direction: { choice: 'flat', confidence: 0.61 },
+            trending: { probability: 0.22 },
+            momentum: { score: 0, legend: 'Weak' },
+          },
+        },
+        { symbol: 'GBPUSD', judgement: null },
+      ],
+    }
+    const rows = judgements([
+      { seq: 1, at_ms: 1000, kind: 'proposal_evaluated', payload: sweep },
+      { seq: 2, at_ms: 2000, kind: 'proposal_evaluated', payload: { outcome: 'trailing_stop', origin: 'autopilot' } },
+      { seq: 3, at_ms: 3000, kind: 'proposal_evaluated', payload: { outcome: 'held', origin: 'autopilot_review', symbol: 'XAUUSD', rationale: 'Trend intact.' } },
+      { seq: 4, at_ms: 4000, kind: 'broker_snapshot', payload: {} },
+    ])
+    expect(rows.map((row) => row.seq)).toEqual([3, 1])
+    expect(rows[0]).toMatchObject({ scope: 'XAUUSD', source: 'Position review', reasoning: 'Trend intact.' })
+    expect(rows[1]).toMatchObject({ conclusion: 'No trade', scope: 'EURUSD, GBPUSD', source: 'Entry sweep' })
+    expect(rows[1].reads).toEqual([{ symbol: 'EURUSD', direction: 'flat', confidence: 0.61, trending: 0.22, momentum: 'Weak' }])
   })
 })
