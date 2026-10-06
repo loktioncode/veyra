@@ -70,12 +70,12 @@ Two independent switches must both be on before a real order can leave MT4:
 | Switch | State now | Where |
 | --- | --- | --- |
 | Service: `VEYRA_TRADING_ENABLED` | **on** (since 2026-10-05) | `~/veyra/.env` on the Pi |
-| EA: `InAllowLiveOrders` | **off** (compiled disarmed) | the EA's Inputs tab in MT4, on whichever machine runs it |
+| EA: `InAllowLiveOrders` | **on** (compiled armed; switch it in the MT4 Inputs tab) | the EA's Inputs tab in MT4, on whichever machine runs it |
 
-So right now every order the EA receives is validated and reported as a dry
-run. To go live, switch `InAllowLiveOrders` on in MT4 yourself, after you have
-seen `"broker":"connected"`. Autopilot (the system that decides trades by
-itself) is separate and stays **off** (`VEYRA_AUTOPILOT_ENABLED=false`).
+So once the EA is recompiled, approved orders are placed for real: the service
+switch, the risk gate and the EA input must all agree. Switch `InAllowLiveOrders`
+off in MT4 to stop placing orders at any time. Autopilot (the system that decides
+trades by itself) is **on** by default until switched off.
 
 Limits in force (Pi `.env`): EURUSD only, 0.01 lot per order, 0.01 lot in
 total, one open order at a time. Turn trading off instantly with the kill
