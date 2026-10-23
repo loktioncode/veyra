@@ -44,7 +44,8 @@ const DEFAULT_MAX_DAILY_LOSS_PERCENT: f64 = 10.0;
 /// Default peak-drawdown breaker as a percentage below the highest equity
 /// since startup (0 disables).
 const DEFAULT_MAX_PEAK_DRAWDOWN_PERCENT: f64 = 25.0;
-/// Default cap on net USD-directional exposure in lots (0 disables).
+/// Default cap on net exposure to any one currency or asset, in lots (0
+/// disables).
 const DEFAULT_MAX_NET_FACTOR_LOTS: f64 = 0.01;
 /// Default news blackout either side of a high-impact event, in minutes.
 const DEFAULT_CALENDAR_BLACKOUT_MINUTES: u64 = 30;
@@ -125,7 +126,7 @@ pub struct RiskPolicyPatch {
     pub max_daily_loss_percent: Option<f64>,
     /// Peak-drawdown breaker, percent (0 disables).
     pub max_peak_drawdown_percent: Option<f64>,
-    /// Net USD-direction cap in lots (0 disables).
+    /// Per-currency (or per-asset) net exposure cap in lots (0 disables).
     pub max_net_factor_lots: Option<f64>,
     /// News blackout either side of a high-impact event, in minutes
     /// (0 disables the check).
@@ -467,7 +468,7 @@ impl RiskPolicy {
 
     /// Sets the valuation and breaker limits:
     /// per-trade risk percent, daily-loss percent, peak-drawdown percent, and
-    /// the net USD-directional lot cap. Zero disables each check.
+    /// the per-currency net exposure lot cap. Zero disables each check.
     pub fn with_limits(
         mut self,
         max_risk_percent: f64,
@@ -981,7 +982,8 @@ impl RiskPolicy {
         self.max_peak_drawdown_percent
     }
 
-    /// Cap on net USD-directional exposure in lots; zero disables.
+    /// Cap on net exposure to any one currency or asset, in lots, counting
+    /// both sides of every pair; zero disables.
     pub fn max_net_factor_lots(&self) -> f64 {
         self.max_net_factor_lots
     }
@@ -1150,7 +1152,7 @@ impl Default for RiskPolicy {
     /// The restrictive baseline: no instrument allowed, smallest volume, one
     /// open order, duplicate suppression on, no session restriction, and the
     /// operational valuation limits (per-trade risk 12%, daily loss 10%, peak
-    /// drawdown 25%, 0.01-lot net USD-direction cap).
+    /// drawdown 25%, 0.01-lot per-currency exposure cap).
     fn default() -> Self {
         Self::new(
             false,

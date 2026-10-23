@@ -9,12 +9,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { api, subscriptions, type CatalogSymbol, type LiveSetting, type SymbolCatalog } from '../lib/api'
 import { forgetSymbolCatalog } from '../lib/hooks'
-import { LiveSettingsPanel } from './settings'
+import { LiveSettingsPanel, SETTINGS_DRAFT_KEY, symbolLimit } from './settings'
+
+/** Real responses can be read twice through `clone()`; the console's request wrapper relies on it. */
+function withClone(response: Response): Response {
+  return Object.assign(response, { clone: () => response })
+}
 
 beforeEach(() => {
   vi.spyOn(subscriptions, 'status').mockResolvedValue({ subscriptions: { codex: { connected: false }, claude_code: { connected: false } } })
 })
-afterEach(() => { cleanup(); vi.restoreAllMocks() })
+afterEach(() => { cleanup(); vi.restoreAllMocks(); sessionStorage.clear() })
 
 /** A promise the test resolves by hand, to observe in-flight states. */
 function deferred<T>() {
@@ -168,6 +173,39 @@ describe('LiveSettingsPanel', () => {
     expect(onRefresh).toHaveBeenCalledOnce()
   })
 
+  it('keeps an unapplied draft through a reload, warns before leaving, and forgets it once applied', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    const first = render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    fireEvent.change(field('VEYRA_AUTOPILOT_TRAIL_R'), { target: { value: '1.5' } })
+    expect(screen.getByText('1 unsaved change. Nothing is in force until Apply.')).toBeTruthy()
+    const leaving = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(leaving)
+    expect(leaving.defaultPrevented).toBe(true)
+
+    // A console redeploy reloads the page: the draft must come back.
+    first.unmount()
+    render(<LiveSettingsPanel settings={settings} onApply={onApply} />)
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').value).toBe('1.5')
+    expect(field('VEYRA_AUTOPILOT_TRAIL_R').className).toBe('tab-input is-dirty')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+    await waitFor(() => expect(onApply).toHaveBeenCalledWith({ VEYRA_AUTOPILOT_TRAIL_R: '1.5' }))
+    await waitFor(() => expect(sessionStorage.getItem(SETTINGS_DRAFT_KEY)).toBeNull())
+    const after = new Event('beforeunload', { cancelable: true })
+    window.dispatchEvent(after)
+    expect(after.defaultPrevented).toBe(false)
+  })
+
+  it('ignores a stored draft it cannot read', () => {
+    sessionStorage.setItem(SETTINGS_DRAFT_KEY, '[not json')
+    render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true)
+    sessionStorage.setItem(SETTINGS_DRAFT_KEY, '["array"]')
+    cleanup()
+    render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} />)
+    expect((screen.getByRole('button', { name: 'Apply' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
   it('holds skeleton rows before the config response arrives', () => {
     const { container } = render(<LiveSettingsPanel />)
     expect(screen.getByText('Live settings')).toBeTruthy()
@@ -310,7 +348,7 @@ describe('LiveSettingsPanel', () => {
 
   describe('API credential panel', () => {
     function jsonResponse(body: unknown, status = 200): Response {
-      return { ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response
+      return withClone({ ok: status >= 200 && status < 300, status, json: async () => body } as unknown as Response)
     }
 
     /** Scoped to the credential card: its "Operator token" field is not the only one on screen. */
@@ -408,7 +446,7 @@ describe('LiveSettingsPanel', () => {
     it('surfaces a rejected credential update by message, and a bodyless failure by status', async () => {
       const fetchMock = vi.fn()
         .mockResolvedValueOnce(jsonResponse({ reason: 'token rejected' }, 401))
-        .mockResolvedValueOnce({ ok: false, status: 500, json: async () => { throw new Error('not json') } } as unknown as Response)
+        .mockResolvedValueOnce(withClone({ ok: false, status: 500, json: async () => { throw new Error('not json') } } as unknown as Response))
       vi.stubGlobal('fetch', fetchMock)
       render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
       const panel = within(credentialPanel())
@@ -555,5 +593,13 @@ describe('LiveSettingsPanel instruments', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: 'Revert' }))
     expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'VEYRA_AUTOPILOT_SYMBOLS: set either Symbol or Symbols')
+  })
+})
+
+describe('symbolLimit', () => {
+  it('uses a valid instrument limit and falls back to the service default', () => {
+    expect(symbolLimit('40')).toBe(40)
+    expect(symbolLimit(' 1 ')).toBe(1)
+    for (const raw of ['', '0', '65', '2.5', 'many']) expect(symbolLimit(raw)).toBe(16)
   })
 })

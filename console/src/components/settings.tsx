@@ -3,12 +3,12 @@
  * editing its environment, grouped the way an operator thinks about them.
  */
 
-import { Fragment, useId, useState } from 'react'
+import { Fragment, useEffect, useId, useState } from 'react'
 import type { ChangeEvent, ReactNode } from 'react'
 
 import { changeModelCredential, type LiveSetting, type RuntimeConfigPatch, type SecretStatus } from '../lib/api'
 import { Button, Control, ControlHead, SkeletonRows, TextControl } from './form'
-import { SymbolPicker, joinSymbolList, parseSymbolList } from './symbols'
+import { MAX_AUTOPILOT_SYMBOLS, SymbolPicker, joinSymbolList, parseSymbolList } from './symbols'
 import { SubscriptionConnections } from './subscriptions'
 import { Icon, Panel, Toggle } from './ui'
 import '../styles/provider.css'
@@ -31,6 +31,7 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
       'VEYRA_AUTOPILOT_ENABLED',
       'VEYRA_AUTOPILOT_SYMBOL',
       'VEYRA_AUTOPILOT_SYMBOLS',
+      'VEYRA_AUTOPILOT_MAX_SYMBOLS',
       'VEYRA_AUTOPILOT_TIMEFRAME',
       'VEYRA_AUTOPILOT_BARS',
       'VEYRA_AUTOPILOT_TIER',
@@ -63,6 +64,7 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
       'VEYRA_MODEL_PROVIDER',
       'VEYRA_MODEL_PREFER_SUBSCRIPTION',
       'VEYRA_MODEL_CHATGPT_MODEL',
+      'VEYRA_MODEL_CLAUDE_MODEL',
       'VEYRA_MODEL_FAST',
       'VEYRA_MODEL_BALANCED',
       'VEYRA_MODEL_REASONING',
@@ -116,7 +118,9 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_AUTOPILOT_SYMBOL:
     'The one instrument the autopilot trades; empty means XAUUSD (gold). Leave empty when Symbols is set.',
   VEYRA_AUTOPILOT_SYMBOLS:
-    "Instruments the autopilot chooses from, up to 16, one trade per cycle. Each must also be on the risk gate's allowed list.",
+    "Instruments the autopilot chooses from, one trade per cycle, up to the instrument limit. Each must also be on the risk gate's allowed list.",
+  VEYRA_AUTOPILOT_MAX_SYMBOLS:
+    'Most instruments the autopilot may rotate through, 1–64; empty means 16. Each one adds terminal reads and prompt length to every cycle.',
   VEYRA_AUTOPILOT_TIMEFRAME:
     'Candle size the autopilot reads market data and judgements on. Defaults to H4, four-hour candles.',
   VEYRA_AUTOPILOT_BARS: 'Closed candles the autopilot reads per instrument each cycle, 10–240; empty means 48.',
@@ -167,8 +171,9 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_MODEL_MAX_CALLS_PER_DAY:
     'Most model calls allowed per day; beyond it, calls are refused until the window resets. Empty or 0 means unlimited.',
   VEYRA_MODEL_PREFER_SUBSCRIPTION:
-    'While a ChatGPT subscription is signed in, every model call tries it first; the provider above takes over when it fails.',
+    'Signed-in subscriptions answer every model call first, ChatGPT then Claude; the provider above takes over when they fail.',
   VEYRA_MODEL_CHATGPT_MODEL: 'Model used on the ChatGPT subscription for every tier; empty means gpt-6-luna.',
+  VEYRA_MODEL_CLAUDE_MODEL: 'Model used on the Claude subscription for every tier; empty means claude-sonnet-5-5.',
   VEYRA_MODEL_COMPEL_STRUCTURED:
     'Requires the model to answer in the structured format instead of merely offering it. Turn off for reasoning models, which refuse it.',
   VEYRA_MODEL_PROVIDER:
@@ -287,6 +292,34 @@ const SETTING_KINDS: Record<string, SettingKind> = {
 }
 
 /** A value as the service reads it: empty means the setting's fallback. */
+/** Where unapplied edits wait, so a reload (a console redeploy reloads the page) does not lose them. */
+export const SETTINGS_DRAFT_KEY = 'veyra.settingsDraft.v1'
+
+function readDraft(): Record<string, string> {
+  try {
+    const parsed: unknown = JSON.parse(sessionStorage.getItem(SETTINGS_DRAFT_KEY) ?? '{}')
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+  } catch {
+    return {}
+  }
+}
+
+function writeDraft(draft: Record<string, string>) {
+  try {
+    if (Object.keys(draft).length === 0) sessionStorage.removeItem(SETTINGS_DRAFT_KEY)
+    else sessionStorage.setItem(SETTINGS_DRAFT_KEY, JSON.stringify(draft))
+  } catch {
+    // Private windows and full storage still work; the draft just lives in the page.
+  }
+}
+
+/** The picker's limit: the instrument-limit setting when it is a valid 1–64, else the service default. */
+export function symbolLimit(raw: string): number {
+  const value = Number(raw.trim())
+  return raw.trim() !== '' && Number.isInteger(value) && value >= 1 && value <= 64 ? value : MAX_AUTOPILOT_SYMBOLS
+}
+
 function settingValue(name: string, raw: string): string {
   const kind = SETTING_KINDS[name]
   if (!kind || raw.trim() !== '') return raw.trim()
@@ -502,10 +535,25 @@ export function LiveSettingsPanel({
   onApply?: (patch: RuntimeConfigPatch) => Promise<string | undefined>
   onRefresh?: () => void
 }) {
-  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [draft, setDraft] = useState<Record<string, string>>(readDraft)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const [saved, setSaved] = useState(false)
+
+  // Names this service still offers whose drafted value differs from what is applied.
+  const dirty = settings
+    ? Object.keys(draft).filter((name) => settings[name] !== undefined && settingValue(name, draft[name]) !== settingValue(name, settings[name].value))
+    : []
+  const unsaved = dirty.length > 0
+
+  useEffect(() => writeDraft(draft), [draft])
+  // Leaving with unapplied edits asks first; a reload keeps them either way.
+  useEffect(() => {
+    if (!unsaved) return
+    const warn = (event: BeforeUnloadEvent) => event.preventDefault()
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [unsaved])
 
   if (!settings) {
     return (
@@ -517,9 +565,7 @@ export function LiveSettingsPanel({
 
   // Only rendered names ever reach the draft, and those exist in `settings`.
   const effective = (name: string) => draft[name] ?? settings[name].value
-  const isDirty = (name: string) =>
-    name in draft && settingValue(name, draft[name]) !== settingValue(name, settings[name].value)
-  const dirty = Object.keys(draft).filter(isDirty)
+  const isDirty = (name: string) => dirty.includes(name)
 
   const submit = async () => {
     if (!onApply || dirty.length === 0) return
@@ -666,6 +712,7 @@ export function LiveSettingsPanel({
                         label="Instruments"
                         help={help}
                         value={chosen}
+                        max={symbolLimit(settings.VEYRA_AUTOPILOT_MAX_SYMBOLS ? effective('VEYRA_AUTOPILOT_MAX_SYMBOLS') : '')}
                         dirty={isDirty(name) || isDirty('VEYRA_AUTOPILOT_SYMBOL')}
                         disabled={busy}
                         aside={
@@ -756,6 +803,10 @@ export function LiveSettingsPanel({
         {error ? (
           <p className="tab-error" role="alert">
             {error}
+          </p>
+        ) : unsaved ? (
+          <p className="tab-settings-pending" role="status">
+            {dirty.length === 1 ? '1 unsaved change' : `${dirty.length} unsaved changes`}. Nothing is in force until Apply.
           </p>
         ) : (
           <span />

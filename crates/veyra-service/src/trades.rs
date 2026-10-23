@@ -310,7 +310,7 @@ fn evidence_from_rows(rows: &[AuditRow], open_commands: &[String]) -> TicketEvid
 
 /// Favourable move ÷ |entry − original stop|, rounded to 2 decimals, or
 /// `None` without a usable original stop.
-fn r_multiple(trade: &ClosedTradePayload, original_stop: Option<f64>) -> Option<f64> {
+pub(crate) fn r_multiple(trade: &ClosedTradePayload, original_stop: Option<f64>) -> Option<f64> {
     let stop = original_stop?;
     let risk = (trade.open_price - stop).abs();
     if risk <= 0.0 {

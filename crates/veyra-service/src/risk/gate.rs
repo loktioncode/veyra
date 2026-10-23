@@ -124,7 +124,7 @@ pub enum RiskCode {
     DailyLossLimitReached,
     /// Equity is below the peak-drawdown breaker.
     PeakDrawdownLimitReached,
-    /// The net directional exposure would exceed the factor cap.
+    /// The net exposure to one currency or asset would exceed the factor cap.
     FactorExposureAboveLimit,
     /// A high-impact news release for the instrument is inside the blackout.
     NewsBlackout,
@@ -186,7 +186,7 @@ impl RiskCode {
             Self::DailyLossLimitReached => "equity is below the daily-loss breaker",
             Self::PeakDrawdownLimitReached => "equity is below the peak-drawdown breaker",
             Self::FactorExposureAboveLimit => {
-                "net directional exposure would exceed the factor cap"
+                "net exposure to one currency or asset would exceed the factor cap"
             }
             Self::TradingNotAllowed => "the terminal reports trading is not allowed",
             Self::OrderLimitReached => "the venue already holds the maximum tolerated orders",
@@ -315,13 +315,14 @@ impl RiskGate {
         account: Option<AccountFacts>,
         now: SystemTime,
     ) -> RiskDecision {
+        let venue = venue_spelling(draft, account.as_ref());
         match self.check(draft, account, now) {
             Err(code) => Self::reject(code),
             Ok(()) => {
                 if self.suppress_duplicate(draft, now) {
                     return Self::reject(RiskCode::DuplicateIntent);
                 }
-                RiskDecision::Approved(TradeIntent::approve(self.canonical(draft)))
+                RiskDecision::Approved(TradeIntent::approve(self.canonical(draft, venue)))
             }
         }
     }
@@ -335,24 +336,30 @@ impl RiskGate {
         account: Option<AccountFacts>,
         now: SystemTime,
     ) -> RiskDecision {
+        let venue = venue_spelling(draft, account.as_ref());
         match self.check(draft, account, now) {
             Err(code) => Self::reject(code),
-            Ok(()) => RiskDecision::Approved(TradeIntent::approve(self.canonical(draft))),
+            Ok(()) => RiskDecision::Approved(TradeIntent::approve(self.canonical(draft, venue))),
         }
     }
 
-    /// The draft spelled as the allowlist spells its symbol, so the order
-    /// reaches the terminal under the broker's own name (`SP500m`) even when
-    /// the model or operator typed another case.
-    fn canonical(&self, draft: &TradeIntentDraft) -> TradeIntentDraft {
-        match self
-            .policy()
-            .symbols()
-            .iter()
-            .find(|allowed| *allowed == draft.symbol())
-        {
-            Some(allowed) if allowed.as_str() != draft.symbol().as_str() => {
-                draft.with_symbol_spelling(allowed.clone())
+    /// The draft spelled as the broker spells its symbol (`SP500m`), so the
+    /// order reaches the terminal under a name it knows even when the model
+    /// or operator typed another case. The terminal's own contract is the
+    /// authority; without one the allowlist's spelling is used. A stored
+    /// allowlist can hold a stale spelling (one saved by an older build was
+    /// upper-cased), and sending that to the terminal fails the order.
+    fn canonical(&self, draft: &TradeIntentDraft, venue: Option<Symbol>) -> TradeIntentDraft {
+        let spelling = venue.or_else(|| {
+            self.policy()
+                .symbols()
+                .iter()
+                .find(|allowed| *allowed == draft.symbol())
+                .cloned()
+        });
+        match spelling {
+            Some(spelled) if spelled.as_str() != draft.symbol().as_str() => {
+                draft.with_symbol_spelling(spelled)
             }
             _ => draft.clone(),
         }
@@ -494,11 +501,17 @@ impl RiskGate {
                 }
             }
         }
-        if policy.max_net_factor_lots() > 0.0 {
-            let net = valuation::net_usd_lots(&account.open_positions, draft);
-            if net.abs() > policy.max_net_factor_lots() + EXPOSURE_EPSILON {
-                return Err(RiskCode::FactorExposureAboveLimit);
-            }
+        // Every asset the draft trades is held to the cap, but only a draft
+        // that grows an exposure is refused: a trade that unwinds part of a
+        // stacked bet is always allowed, even while the book is over the cap.
+        if valuation::breaches_factor_cap(
+            &account.open_positions,
+            draft.symbol(),
+            draft.side(),
+            draft.volume().value(),
+            policy.max_net_factor_lots(),
+        ) {
+            return Err(RiskCode::FactorExposureAboveLimit);
         }
         Ok(())
     }
@@ -538,6 +551,16 @@ impl RiskGate {
         });
         false
     }
+}
+
+/// The terminal's own spelling of the draft's symbol, from the contract it
+/// reported for that instrument, when the facts carry one.
+fn venue_spelling(draft: &TradeIntentDraft, account: Option<&AccountFacts>) -> Option<Symbol> {
+    account?
+        .symbol_specs
+        .iter()
+        .find(|spec| spec.symbol.eq_ignore_ascii_case(draft.symbol().as_str()))
+        .and_then(|spec| Symbol::parse(&spec.symbol).ok())
 }
 
 /// The live quote a market order on `side` would fill at: the ask for a buy,
@@ -734,6 +757,53 @@ mod tests {
         index_facts.symbol_specs = vec![venue_spec("SP500m", true)];
         let intent = expect_approved(gate.evaluate(&shouted, Some(index_facts), wednesday));
         assert_eq!(intent.draft().symbol().as_str(), "SP500m");
+
+        // Without a contract the allowlist's spelling is all there is.
+        let gate = RiskGate::new(policy_with_symbols(
+            policy(),
+            vec![Symbol::parse("EURUSD").expect("symbol")],
+        ));
+        let lower = TradeIntentDraft::new(
+            Symbol::parse("eurusd").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.1).expect("volume"),
+            None,
+            None,
+            None,
+        );
+        let intent = expect_approved(gate.evaluate(&lower, Some(facts_test(0)), wednesday));
+        assert_eq!(intent.draft().symbol().as_str(), "EURUSD");
+    }
+
+    #[test]
+    fn the_terminals_spelling_beats_a_stale_allowlist_spelling() {
+        // An older build saved the allowlist upper-cased. Sending `SP500M`
+        // back to the terminal failed its contract lookup ("symbol
+        // unavailable"), so every SP500m entry died at the final check.
+        let stale = Symbol::parse("SP500M").expect("symbol");
+        let gate = RiskGate::new(policy_with_symbols(policy(), vec![stale]));
+        let wednesday = UNIX_EPOCH + Duration::from_secs(1_767_787_200);
+        let as_offered = TradeIntentDraft::new(
+            Symbol::parse("SP500m").expect("symbol"),
+            Side::Buy,
+            OrderKind::Market,
+            Volume::parse(0.1).expect("volume"),
+            None,
+            None,
+            None,
+        );
+        let mut index_facts = facts_test(0);
+        index_facts.symbol_specs = vec![venue_spec("SP500m", true)];
+        for decision in [
+            gate.preview(&as_offered, Some(index_facts.clone()), wednesday),
+            gate.evaluate(&as_offered, Some(index_facts), wednesday),
+        ] {
+            assert_eq!(
+                expect_approved(decision).draft().symbol().as_str(),
+                "SP500m"
+            );
+        }
     }
 
     #[test]
@@ -1443,6 +1513,82 @@ mod tests {
             ),
             RiskDecision::Approved(_)
         ));
+    }
+
+    #[test]
+    fn net_factor_cap_counts_every_currency_a_cross_trades() {
+        let now = at(10);
+        let names = ["AUDCHF", "AUDJPY", "GBPAUD", "AUDCAD", "AUDNZD", "EURCHF"];
+        let gate = RiskGate::new(
+            RiskPolicy::new(
+                false,
+                names
+                    .iter()
+                    .map(|name| Symbol::parse(name).expect("symbol"))
+                    .collect(),
+                Volume::parse(0.5).expect("volume"),
+                Volume::parse(0.5).expect("volume"),
+                10,
+                Duration::from_secs(60),
+                None,
+            )
+            .with_limits(0.0, 0.0, 0.0, 0.02),
+        );
+        let book = |held: &[(&str, Side)]| {
+            let mut facts = facts_test(u32::try_from(held.len()).expect("count"));
+            for (name, side) in held {
+                let symbol = Symbol::parse(name).expect("symbol");
+                facts.open_symbols.push(symbol.clone());
+                facts.open_positions.push(PositionFact {
+                    symbol,
+                    side: *side,
+                    lots: 0.01,
+                });
+            }
+            facts.open_lots = 0.01 * held.len() as f64;
+            Some(facts)
+        };
+        let short_aud = book(&[("AUDCHF", Side::Sell), ("GBPAUD", Side::Buy)]);
+
+        // Short AUDCHF and long GBPAUD are already 0.02 short AUD, so a third
+        // AUD short is refused although no dollar is involved.
+        let third = draft_sided("AUDCAD", Side::Sell, 0.01, 0.99);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&third, short_aud.clone(), now)).code(),
+            RiskCode::FactorExposureAboveLimit
+        );
+
+        // The other side of the same currency is still open...
+        let unwind = draft_sided("AUDNZD", Side::Buy, 0.01, 1.10);
+        assert!(matches!(
+            gate.evaluate(&unwind, short_aud.clone(), now),
+            RiskDecision::Approved(_)
+        ));
+
+        // ...and so is a trade sharing no stacked currency.
+        let fresh = draft_sided("EURCHF", Side::Sell, 0.01, 0.95);
+        assert!(matches!(
+            gate.evaluate(&fresh, short_aud, now),
+            RiskDecision::Approved(_)
+        ));
+
+        // A book already past the cap (here after the cap was lowered) may
+        // always shrink, but never grow. An hour later, so the approval above
+        // is not a duplicate.
+        let later = at(11);
+        let over = book(&[
+            ("AUDCHF", Side::Sell),
+            ("GBPAUD", Side::Buy),
+            ("AUDJPY", Side::Sell),
+        ]);
+        assert!(matches!(
+            gate.evaluate(&unwind, over.clone(), later),
+            RiskDecision::Approved(_)
+        ));
+        assert_eq!(
+            expect_rejection(gate.evaluate(&third, over, later)).code(),
+            RiskCode::FactorExposureAboveLimit
+        );
     }
 
     #[test]

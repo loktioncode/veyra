@@ -7,9 +7,9 @@
 //! [`ModelRuntime`]. Adding a provider (or Jev) means adding an implementation
 //! plus a selector; callers do not change.
 //!
-//! When a ChatGPT subscription is connected and
-//! `VEYRA_MODEL_PREFER_SUBSCRIPTION` is on, the runtime routes every call to
-//! the subscription first and falls back to the configured provider's chain.
+//! When `VEYRA_MODEL_PREFER_SUBSCRIPTION` is on, the runtime routes every call
+//! to the connected subscriptions first (ChatGPT, then Claude) and falls back
+//! to the configured provider's chain.
 //! Every candidate on every route is subject to the shared per-model
 //! cooldowns in [`cooldown`]; the call budget wraps the whole route once.
 
@@ -37,7 +37,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::subscription_auth::{SubscriptionAuthState, SubscriptionProvider};
-use preferred::{PreferredEngine, SubscriptionGate};
+use preferred::{PreferredEngine, SubscriptionGate, SubscriptionLeg};
+
+/// Subscriptions in the order the subscription-first route tries them.
+const PREFERRED_SUBSCRIPTIONS: [SubscriptionProvider; 2] = [
+    SubscriptionProvider::Codex,
+    SubscriptionProvider::ClaudeCode,
+];
 
 /// Operator-facing label for a candidate served by the ChatGPT subscription,
 /// so status output can tell it apart from an API model of the same name.
@@ -316,27 +322,44 @@ pub struct ModelRuntime {
     tiers: TierModels,
     /// Settings this runtime was built from; absent for injected test engines.
     settings: Option<ModelSettings>,
-    /// The ChatGPT subscription leg in front of the configured chain, when the
-    /// composite was built.
-    preferred: Option<PreferredLeg>,
-    /// ChatGPT connection state observed at build time, recorded only when the
-    /// subscription preference applies. A difference from the live state means
-    /// the route is stale and must be rebuilt.
-    chatgpt_connected_at_build: Option<bool>,
+    /// The subscription legs in front of the configured chain, in order, when
+    /// the composite was built.
+    preferred: Vec<PreferredLeg>,
+    /// Connection state of each [`PREFERRED_SUBSCRIPTIONS`] entry observed at
+    /// build time, recorded only when the subscription preference applies. A
+    /// difference from the live state means the route is stale and must be
+    /// rebuilt.
+    connected_at_build: Option<[bool; 2]>,
 }
 
-/// The preferred subscription leg as the runtime reports it.
+/// One preferred subscription leg as the runtime reports it.
 #[derive(Debug, Clone)]
 struct PreferredLeg {
+    provider: SubscriptionProvider,
     model: String,
     gate: SubscriptionGate,
+}
+
+impl PreferredLeg {
+    /// The leg's candidate as `/status` reports it.
+    fn label(&self) -> String {
+        match self.provider {
+            SubscriptionProvider::Codex => chatgpt_label(&self.model),
+            SubscriptionProvider::ClaudeCode => self.model.clone(),
+        }
+    }
 }
 
 /// Route facts decided while building, beyond the engine itself.
 #[derive(Debug, Default)]
 struct RouteShape {
-    preferred: Option<PreferredLeg>,
-    chatgpt_connected_at_build: Option<bool>,
+    preferred: Vec<PreferredLeg>,
+    connected_at_build: Option<[bool; 2]>,
+}
+
+/// Live connection state of every preferred subscription, in route order.
+fn connected_now(auth: &SubscriptionAuthState) -> [bool; 2] {
+    PREFERRED_SUBSCRIPTIONS.map(|provider| auth.connected(provider))
 }
 
 impl ModelRuntime {
@@ -370,12 +393,13 @@ impl ModelRuntime {
     /// Builds an API or connected subscription provider from the same narrow
     /// decision contract, preserving the call budget for both transports.
     ///
-    /// For an API provider with `VEYRA_MODEL_PREFER_SUBSCRIPTION` on and the
-    /// ChatGPT subscription connected, the engine is the subscription-first
-    /// composite. A subscription leg that cannot be built (for example without
-    /// encrypted storage) is logged and left out rather than disabling the
-    /// configured provider. The Claude Code provider is built exactly as
-    /// configured and never joins a composite.
+    /// For an API provider with `VEYRA_MODEL_PREFER_SUBSCRIPTION` on and a
+    /// subscription connected, the engine is the subscription-first
+    /// composite: every connected subscription in [`PREFERRED_SUBSCRIPTIONS`]
+    /// order, then the configured chain. A subscription leg that cannot be
+    /// built (for example without encrypted storage) is logged and left out
+    /// rather than disabling the configured provider. A subscription selected
+    /// as the provider itself is built exactly as configured.
     ///
     /// # Errors
     /// Returns [`ModelError::Construction`] when the configured provider
@@ -398,44 +422,62 @@ impl ModelRuntime {
         if !settings.prefer_subscription() {
             return Ok(Self::wrap_engine(settings, api, RouteShape::default()));
         }
-        let connected = app
-            .subscription_auth()
-            .connected(SubscriptionProvider::Codex);
+        let auth = app.subscription_auth();
         let mut shape = RouteShape {
-            preferred: None,
-            chatgpt_connected_at_build: Some(connected),
+            preferred: Vec::new(),
+            connected_at_build: Some(connected_now(auth)),
         };
-        if !connected {
+        let mut legs = Vec::new();
+        for provider in PREFERRED_SUBSCRIPTIONS {
+            if !auth.connected(provider) {
+                continue;
+            }
+            let (built, model) = match provider {
+                SubscriptionProvider::Codex => (
+                    SubscriptionEngine::build_chatgpt(settings.chatgpt_model(), app),
+                    settings.chatgpt_model(),
+                ),
+                SubscriptionProvider::ClaudeCode => (
+                    SubscriptionEngine::build_claude(settings.claude_model(), app),
+                    settings.claude_model(),
+                ),
+            };
+            match built {
+                Ok(engine) => {
+                    let gate = SubscriptionGate::connected(auth.clone(), provider);
+                    legs.push(SubscriptionLeg::new(Arc::new(engine), model, gate.clone()));
+                    shape.preferred.push(PreferredLeg {
+                        provider,
+                        model: model.to_owned(),
+                        gate,
+                    });
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    subscription = provider.as_str(),
+                    provider = settings.provider().as_str(),
+                    "subscription is connected but cannot be used; leaving it out of the route"
+                ),
+            }
+        }
+        if legs.is_empty() {
             return Ok(Self::wrap_engine(settings, api, shape));
         }
-        let subscription = match SubscriptionEngine::build_chatgpt(settings.chatgpt_model(), app) {
-            Ok(subscription) => Arc::new(subscription),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    provider = settings.provider().as_str(),
-                    "ChatGPT subscription is connected but cannot be used; continuing with the configured provider"
-                );
-                return Ok(Self::wrap_engine(settings, api, shape));
-            }
-        };
-        let gate = SubscriptionGate::chatgpt(app.subscription_auth().clone());
         let composite = PreferredEngine::new(
-            subscription,
-            settings.chatgpt_model(),
-            gate.clone(),
+            legs,
             api,
             settings.tiers().clone(),
             app.model_cooldowns().clone(),
         );
-        shape.preferred = Some(PreferredLeg {
-            model: settings.chatgpt_model().to_owned(),
-            gate,
-        });
         tracing::info!(
-            model = %chatgpt_label(settings.chatgpt_model()),
+            subscriptions = %shape
+                .preferred
+                .iter()
+                .map(PreferredLeg::label)
+                .collect::<Vec<_>>()
+                .join(", "),
             fallback_provider = settings.provider().as_str(),
-            "ChatGPT subscription is the preferred model route"
+            "connected subscriptions lead the model route"
         );
         Ok(Self::wrap_engine(settings, Arc::new(composite), shape))
     }
@@ -454,7 +496,7 @@ impl ModelRuntime {
             budget,
             tiers: settings.tiers().clone(),
             preferred: shape.preferred,
-            chatgpt_connected_at_build: shape.chatgpt_connected_at_build,
+            connected_at_build: shape.connected_at_build,
             settings: Some(settings),
         }
     }
@@ -499,17 +541,17 @@ impl ModelRuntime {
     }
 
     /// Every candidate currently in force for a tier, in the order they are
-    /// tried, labelled as `/status` reports them: the ChatGPT subscription
-    /// (`chatgpt:<model>`) first while it is preferred and connected, then the
-    /// configured chain. Cooling candidates are included; they are listed
-    /// separately by the cooldown registry.
+    /// tried, labelled as `/status` reports them: each preferred subscription
+    /// while it is connected (ChatGPT as `chatgpt:<model>`, then Claude by its
+    /// model), then the configured chain. Cooling candidates are included;
+    /// they are listed separately by the cooldown registry.
     pub fn route(&self, tier: ModelTier) -> Vec<String> {
-        let mut route = Vec::new();
-        if let Some(preferred) = &self.preferred
-            && preferred.gate.ready()
-        {
-            route.push(chatgpt_label(&preferred.model));
-        }
+        let mut route: Vec<String> = self
+            .preferred
+            .iter()
+            .filter(|leg| leg.gate.ready())
+            .map(PreferredLeg::label)
+            .collect();
         let chain = self.tiers.chain(tier);
         if self.provider == ModelProvider::Codex {
             route.extend(chain.iter().map(|model| chatgpt_label(model)));
@@ -519,9 +561,9 @@ impl ModelRuntime {
         route
     }
 
-    /// Whether the ChatGPT subscription leg was built into this runtime.
+    /// Whether a subscription leg was built into this runtime.
     pub fn prefers_subscription(&self) -> bool {
-        self.preferred.is_some()
+        !self.preferred.is_empty()
     }
 
     /// Settings the runtime was built from, when it was built from settings.
@@ -529,14 +571,14 @@ impl ModelRuntime {
         self.settings.as_ref()
     }
 
-    /// Whether the ChatGPT connection has changed since this runtime was
-    /// built while the subscription preference applies — a connect, a
-    /// disconnect, or a refresh that left the subscription needing to be
-    /// reconnected. A stale runtime must be rebuilt to put its route back in
-    /// step with the connection.
+    /// Whether any preferred subscription's connection has changed since
+    /// this runtime was built while the subscription preference applies — a
+    /// connect, a disconnect, or a refresh that left a subscription needing to
+    /// be reconnected. A stale runtime must be rebuilt to put its route back
+    /// in step with the connections.
     pub fn subscription_route_stale(&self, auth: &SubscriptionAuthState) -> bool {
-        self.chatgpt_connected_at_build
-            .is_some_and(|at_build| at_build != auth.connected(SubscriptionProvider::Codex))
+        self.connected_at_build
+            .is_some_and(|at_build| at_build != connected_now(auth))
     }
 
     /// Whether two runtimes route the same candidates with the same
@@ -547,9 +589,12 @@ impl ModelRuntime {
             _ => false,
         };
         same_settings
-            && self.preferred.as_ref().map(|leg| &leg.model)
-                == other.preferred.as_ref().map(|leg| &leg.model)
-            && self.chatgpt_connected_at_build == other.chatgpt_connected_at_build
+            && self
+                .preferred
+                .iter()
+                .map(PreferredLeg::label)
+                .eq(other.preferred.iter().map(PreferredLeg::label))
+            && self.connected_at_build == other.connected_at_build
     }
 
     /// Whether both handles share the same engine instance.
@@ -584,8 +629,8 @@ impl ModelRuntime {
             budget: Arc::new(BudgetTracker::new(BudgetPolicy::default())),
             tiers: TierModels::new("test/fast", "test/balanced", "test/reasoning"),
             settings: None,
-            preferred: None,
-            chatgpt_connected_at_build: None,
+            preferred: Vec::new(),
+            connected_at_build: None,
         }
     }
 }
@@ -673,6 +718,51 @@ mod tests {
         assert!(runtime.same_route(&runtime.clone()));
         assert!(runtime.same_instance(&runtime.clone()));
         assert!(!runtime.same_instance(&custom));
+    }
+
+    #[actix_web::test]
+    async fn every_connected_subscription_leads_the_route_chatgpt_first() {
+        let (both, _store) = app(
+            CooldownRegistry::new(),
+            &[
+                SubscriptionProvider::Codex,
+                SubscriptionProvider::ClaudeCode,
+            ],
+        );
+        let runtime = ModelRuntime::from_settings_with_app(settings(&[]), &both)
+            .expect("the composite builds");
+        assert!(runtime.prefers_subscription());
+        let mut expected = vec![
+            "chatgpt:gpt-6-luna".to_owned(),
+            settings::DEFAULT_CLAUDE_MODEL.to_owned(),
+        ];
+        expected.extend(API_ROUTE.iter().map(|model| (*model).to_owned()));
+        assert_eq!(runtime.route(ModelTier::Balanced), expected);
+        assert!(!runtime.subscription_route_stale(both.subscription_auth()));
+
+        // Claude alone leads with its own model, never an API tier model.
+        let (claude, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::ClaudeCode]);
+        let alone = ModelRuntime::from_settings_with_app(
+            settings(&[("VEYRA_MODEL_CLAUDE_MODEL", "claude-opus-5-5")]),
+            &claude,
+        )
+        .expect("builds");
+        assert_eq!(alone.route(ModelTier::Fast)[0], "claude-opus-5-5");
+        assert_eq!(&alone.route(ModelTier::Fast)[1..], API_ROUTE);
+        assert!(
+            !alone.same_route(&runtime),
+            "a different leg set is a new route"
+        );
+
+        // A Claude connection arriving later makes a ChatGPT-only route stale.
+        let (chatgpt, _store) = app(CooldownRegistry::new(), &[SubscriptionProvider::Codex]);
+        let earlier =
+            ModelRuntime::from_settings_with_app(settings(&[]), &chatgpt).expect("builds");
+        assert!(!earlier.subscription_route_stale(chatgpt.subscription_auth()));
+        chatgpt
+            .subscription_auth()
+            .set_credential(credential(SubscriptionProvider::ClaudeCode, None));
+        assert!(earlier.subscription_route_stale(chatgpt.subscription_auth()));
     }
 
     #[actix_web::test]

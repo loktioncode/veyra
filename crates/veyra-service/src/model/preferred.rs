@@ -1,19 +1,19 @@
-//! ChatGPT-subscription-first routing in front of the configured API chain.
+//! Subscription-first routing in front of the configured API chain.
 //!
-//! When the operator has connected a ChatGPT (Codex) subscription and left
+//! When the operator has connected a subscription and left
 //! `VEYRA_MODEL_PREFER_SUBSCRIPTION` on, every model call — autopilot
 //! decisions, one-shot proposals, and the read-only assistant — tries the
-//! subscription first with `VEYRA_MODEL_CHATGPT_MODEL`, then the configured
-//! provider's normal chain on a failover-worthy failure. The subscription is
-//! only ever sent its own model: the API tier models are a different
-//! provider's identifiers and never reach it.
+//! connected subscriptions first, ChatGPT (`VEYRA_MODEL_CHATGPT_MODEL`) then
+//! Claude (`VEYRA_MODEL_CLAUDE_MODEL`), then the configured provider's normal
+//! chain, moving on at each failover-worthy failure. A subscription is only
+//! ever sent its own model: the API tier models are a different provider's
+//! identifiers and never reach it.
 //!
-//! A ChatGPT outage — the host unreachable, not just one refusal — also falls
-//! through to the configured chain, because it is a different host. The
-//! subscription leg is gated live on the connection state, so a disconnect or
-//! a refresh that fails takes it out of the route immediately, before the
-//! runtime is rebuilt. Only the ChatGPT subscription participates;
-//! the Claude Code subscription is never part of this route.
+//! An outage of one subscription — its host unreachable, not just one
+//! refusal — also falls through to the next leg, because each is a different
+//! host. Every subscription leg is gated live on its connection state, so a
+//! disconnect or a refresh that fails takes it out of the route immediately,
+//! before the runtime is rebuilt.
 
 use std::fmt;
 use std::sync::Arc;
@@ -42,11 +42,9 @@ impl fmt::Debug for SubscriptionGate {
 }
 
 impl SubscriptionGate {
-    /// Ready while the ChatGPT subscription holds a usable credential.
-    pub(crate) fn chatgpt(auth: SubscriptionAuthState) -> Self {
-        Self(Arc::new(move || {
-            auth.connected(SubscriptionProvider::Codex)
-        }))
+    /// Ready while `provider`'s subscription holds a usable credential.
+    pub(crate) fn connected(auth: SubscriptionAuthState, provider: SubscriptionProvider) -> Self {
+        Self(Arc::new(move || auth.connected(provider)))
     }
 
     /// A gate driven by an arbitrary check; used by tests.
@@ -61,14 +59,35 @@ impl SubscriptionGate {
     }
 }
 
+/// One subscription in front of the configured chain.
+pub(crate) struct SubscriptionLeg {
+    transport: Arc<dyn CandidateTransport>,
+    /// The subscription's single model, used for every tier.
+    models: Vec<String>,
+    gate: SubscriptionGate,
+}
+
+impl SubscriptionLeg {
+    /// A subscription answering every tier with `model` while `gate` is ready.
+    pub(crate) fn new(
+        transport: Arc<dyn CandidateTransport>,
+        model: &str,
+        gate: SubscriptionGate,
+    ) -> Self {
+        Self {
+            transport,
+            models: vec![model.to_owned()],
+            gate,
+        }
+    }
+}
+
 /// Subscription-first composite over the configured API chain.
 pub(crate) struct PreferredEngine {
     /// The configured API provider, reported as the runtime's provider.
     provider: ModelProvider,
-    subscription: Arc<dyn CandidateTransport>,
-    /// The subscription's single model, used for every tier.
-    subscription_models: Vec<String>,
-    gate: SubscriptionGate,
+    /// Subscriptions in the order they are tried.
+    subscriptions: Vec<SubscriptionLeg>,
     api: Arc<dyn CandidateTransport>,
     api_tiers: TierModels,
     cooldowns: CooldownRegistry,
@@ -80,27 +99,30 @@ impl fmt::Debug for PreferredEngine {
         formatter
             .debug_struct("PreferredEngine")
             .field("provider", &self.provider)
-            .field("subscription_model", &self.subscription_models)
+            .field(
+                "subscription_models",
+                &self
+                    .subscriptions
+                    .iter()
+                    .map(|leg| leg.models.as_slice())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl PreferredEngine {
-    /// Composes the subscription leg (always `chatgpt_model`) in front of the
-    /// API transport and its tier chains.
+    /// Composes the subscription legs, in order, in front of the API
+    /// transport and its tier chains.
     pub(crate) fn new(
-        subscription: Arc<dyn CandidateTransport>,
-        chatgpt_model: &str,
-        gate: SubscriptionGate,
+        subscriptions: Vec<SubscriptionLeg>,
         api: Arc<dyn CandidateTransport>,
         api_tiers: TierModels,
         cooldowns: CooldownRegistry,
     ) -> Self {
         Self {
             provider: api.candidate_provider(),
-            subscription,
-            subscription_models: vec![chatgpt_model.to_owned()],
-            gate,
+            subscriptions,
             api,
             api_tiers,
             cooldowns,
@@ -108,15 +130,17 @@ impl PreferredEngine {
         }
     }
 
-    /// The legs in force for `tier`: the subscription first while it is
-    /// connected, then the configured chain.
+    /// The legs in force for `tier`: each subscription while it is
+    /// connected, in order, then the configured chain.
     fn legs(&self, tier: ModelTier) -> Vec<Leg<'_>> {
-        let mut legs = Vec::with_capacity(2);
-        if self.gate.ready() {
-            legs.push(Leg {
-                transport: self.subscription.as_ref(),
-                models: &self.subscription_models,
-            });
+        let mut legs = Vec::with_capacity(self.subscriptions.len() + 1);
+        for subscription in &self.subscriptions {
+            if subscription.gate.ready() {
+                legs.push(Leg {
+                    transport: subscription.transport.as_ref(),
+                    models: &subscription.models,
+                });
+            }
         }
         legs.push(Leg {
             transport: self.api.as_ref(),
@@ -213,9 +237,11 @@ mod tests {
         let tiers = TierModels::new("deepseek/fast", "deepseek/balanced", "deepseek/reasoning")
             .with_fallbacks(ModelTier::Balanced, vec!["z-ai/glm".to_owned()]);
         let engine = PreferredEngine::new(
-            subscription.clone(),
-            "gpt-6-luna",
-            gate,
+            vec![SubscriptionLeg::new(
+                subscription.clone(),
+                "gpt-6-luna",
+                gate,
+            )],
             api.clone(),
             tiers,
             cooldowns.clone(),
@@ -255,6 +281,58 @@ mod tests {
             self.0 += 1;
         }
         async fn tool_completed(&mut self, _: &str, _: &str, _: &Value, _: bool) {}
+    }
+
+    #[actix_web::test]
+    async fn connected_subscriptions_are_tried_in_order_before_the_api_chain() {
+        let cooldowns = CooldownRegistry::with_clock(ManualClock::new().clock());
+        let chatgpt = Arc::new(ScriptedTransport::new(
+            ModelProvider::Codex,
+            Some("chatgpt"),
+        ));
+        let claude = Arc::new(ScriptedTransport::new(ModelProvider::ClaudeCode, None));
+        let api = Arc::new(ScriptedTransport::new(ModelProvider::OpenRouter, None));
+        let chatgpt_up = Arc::new(AtomicBool::new(true));
+        let claude_up = Arc::new(AtomicBool::new(true));
+        let gate = |flag: &Arc<AtomicBool>| {
+            let flag = flag.clone();
+            SubscriptionGate::from_fn(move || flag.load(Ordering::SeqCst))
+        };
+        let engine = PreferredEngine::new(
+            vec![
+                SubscriptionLeg::new(chatgpt.clone(), "gpt-6-luna", gate(&chatgpt_up)),
+                SubscriptionLeg::new(claude.clone(), "claude-sonnet-5-5", gate(&claude_up)),
+            ],
+            api.clone(),
+            TierModels::new("deepseek/fast", "deepseek/balanced", "deepseek/reasoning"),
+            cooldowns,
+        );
+        assert!(format!("{engine:?}").contains("claude-sonnet-5-5"));
+
+        // ChatGPT refuses: Claude answers before the API chain is touched.
+        chatgpt.push(fail(CooldownReason::RateLimited, "rate_limited"));
+        let answer = engine
+            .answer(request(ModelTier::Balanced))
+            .await
+            .expect("Claude answers");
+        assert_eq!(answer.value["model"], "claude-sonnet-5-5");
+        assert_eq!(claude.asked(), ["claude-sonnet-5-5"]);
+        assert!(api.asked().is_empty());
+
+        // With ChatGPT disconnected, Claude leads; with both gone, the API does.
+        chatgpt_up.store(false, Ordering::SeqCst);
+        let answer = engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect("answers");
+        assert_eq!(answer.value["model"], "claude-sonnet-5-5");
+        claude_up.store(false, Ordering::SeqCst);
+        let answer = engine
+            .answer(request(ModelTier::Fast))
+            .await
+            .expect("answers");
+        assert_eq!(answer.value["model"], "deepseek/fast");
+        assert_eq!(chatgpt.asked(), ["gpt-6-luna"]);
     }
 
     #[actix_web::test]

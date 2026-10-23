@@ -1,7 +1,7 @@
 //! Agent decision loop.
 //!
 //! The model is not limited to one call. It receives the decision context,
-//! then may call read-only tools — asking Jev for calibrated judgements,
+//! then may call read-only tools — asking Jev for its trend readings,
 //! fetching another market window, inspecting account/position/window state,
 //! or dry-running a draft through the deterministic risk gate — and each
 //! result is appended to a transcript and fed back as input. The loop ends

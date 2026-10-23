@@ -4,8 +4,8 @@
 //! judgements out — a choice with a probability distribution, a noul
 //! probability, or a score with a legend, each carrying confidence. It is
 //! deliberately **not** a [`DecisionEngine`](crate::model::DecisionEngine):
-//! it returns calibrated judgements rather than schema-constrained
-//! generations, so it has its own narrow contract ([`SemanticJudge`]), its own
+//! it returns typed judgements with probabilities and confidence rather than
+//! schema-constrained generations, so it has its own narrow contract ([`SemanticJudge`]), its own
 //! validated types ([`contract`]), and its own provider selector
 //! (`VEYRA_JEV_PROVIDER`). Adding another System One provider means adding an
 //! implementation plus a variant; callers do not change.
@@ -17,6 +17,11 @@
 //!
 //! The trade pipeline still owns every decision: Jev judgements are inputs
 //! code may consult, never execution authority.
+//!
+//! Nothing here checks those probabilities against outcomes: a reading is
+//! the judge's own estimate from the state it was given. The autopilot shows
+//! the model how trades on each band of readings actually did
+//! (`trading::judge_record`).
 
 pub mod contract;
 pub mod fallback;

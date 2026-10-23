@@ -10,8 +10,10 @@
 //! and it can lead the subscription-first composite with the single model from
 //! `VEYRA_MODEL_CHATGPT_MODEL`. A refresh the provider rejects marks it as
 //! needing to be reconnected, which takes it out of every route until the
-//! operator reconnects. The Claude Code subscription keeps its original
-//! request loop and is not affected by cooldowns or preference.
+//! operator reconnects. The Claude Code subscription joins the same composite
+//! after ChatGPT, with the single model from `VEYRA_MODEL_CLAUDE_MODEL`; there
+//! its candidates share the route's cooldowns. Selected as the provider
+//! itself, it keeps its original request loop without cooldowns.
 
 use std::fmt;
 use std::sync::Arc;
@@ -111,6 +113,21 @@ impl SubscriptionEngine {
     pub fn build_chatgpt(model: &str, app: &AppState) -> Result<Self, ModelError> {
         Self::assemble(
             SubscriptionProvider::Codex,
+            super::settings::TierModels::new(model, model, model),
+            app,
+        )
+    }
+
+    /// Builds the Claude subscription leg of the subscription-first route,
+    /// with `model` for every tier, as [`SubscriptionEngine::build_chatgpt`]
+    /// does for ChatGPT.
+    ///
+    /// # Errors
+    /// Returns [`ModelError::Construction`] when the subscription is not
+    /// connected or encrypted storage is missing.
+    pub fn build_claude(model: &str, app: &AppState) -> Result<Self, ModelError> {
+        Self::assemble(
+            SubscriptionProvider::ClaudeCode,
             super::settings::TierModels::new(model, model, model),
             app,
         )
@@ -349,7 +366,7 @@ impl SubscriptionEngine {
                     credential,
                 );
                 if let Some(name) = forced {
-                    body["tool_choice"] = json!({"type":"tool","name":name});
+                    require_claude_tool(&mut body, name);
                 }
                 self.client
                     .post(format!("{CLAUDE_BASE}/v1/messages?beta=true"))
@@ -372,9 +389,25 @@ impl SubscriptionEngine {
             return Err(TransportError::Unauthorized);
         }
         if !status.is_success() {
+            let retry_after = retry_after(response.headers());
+            // The provider's own explanation is the only way to tell a bad
+            // request from a bad model or account; error bodies carry no
+            // credentials, and the text is bounded.
+            let detail = response
+                .text()
+                .await
+                .map(|body| refusal_detail(&body))
+                .unwrap_or_default();
+            tracing::warn!(
+                subscription = self.provider.as_str(),
+                model,
+                status = status.as_u16(),
+                %detail,
+                "subscription provider refused the request"
+            );
             return Err(TransportError::Status {
                 status: status.as_u16(),
-                retry_after: retry_after(response.headers()),
+                retry_after,
             });
         }
         let body = response
@@ -409,15 +442,9 @@ impl SubscriptionEngine {
                 .await
             {
                 Ok(turn) => {
-                    if let Some(call) = turn
-                        .tool_calls
-                        .into_iter()
-                        .find(|call| call.name == request.format.name)
-                    {
+                    if let Some(value) = structured_answer(turn, &request.format.name) {
                         self.telemetry.succeeded(model);
-                        return Ok(DecisionAnswer {
-                            value: call.arguments,
-                        });
+                        return Ok(DecisionAnswer { value });
                     }
                     last = "subscription response omitted required structured answer".to_owned();
                 }
@@ -710,12 +737,8 @@ impl CandidateTransport for SubscriptionEngine {
                     )
                     .await
                     .map_err(|error| classify(&error))?;
-                turn.tool_calls
-                    .into_iter()
-                    .find(|call| call.name == request.format.name)
-                    .map(|call| DecisionAnswer {
-                        value: call.arguments,
-                    })
+                structured_answer(turn, &request.format.name)
+                    .map(|value| DecisionAnswer { value })
                     .ok_or_else(invalid_response)
             }
             Call::Tools { tools, progress } => {
@@ -1005,6 +1028,74 @@ fn claude_body(
     })
 }
 
+/// Asks Claude to answer with the named tool. The subscription refuses a
+/// compelled choice for its models ("tool_choice: type \"tool\" and \"any\"
+/// are not supported for this model"), so the choice stays automatic, thinking
+/// stays on, and the system prompt names the one tool that carries the answer.
+/// The answer is read by [`structured_answer`], which also accepts the JSON
+/// written as text.
+fn require_claude_tool(body: &mut Value, name: &str) {
+    body["tool_choice"] = json!({"type":"auto"});
+    if let Some(system) = body.get_mut("system").and_then(Value::as_array_mut) {
+        system.push(json!({
+            "type":"text",
+            "text":format!("Answer only by calling the {name} tool with the complete answer.")
+        }));
+    }
+}
+
+/// The structured answer carried by one turn: the call to `name`, or, because
+/// an automatic tool choice is advisory, a JSON object the model wrote as text
+/// instead (bare or in one code fence). Anything else is no answer. Either way
+/// the caller's schema check still decides whether the value is valid.
+fn structured_answer(turn: AssistantTurn, name: &str) -> Option<Value> {
+    let content = turn.content;
+    if let Some(call) = turn.tool_calls.into_iter().find(|call| call.name == name) {
+        return Some(call.arguments);
+    }
+    let text = content?;
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .unwrap_or(trimmed);
+    serde_json::from_str::<Value>(unfenced.trim())
+        .ok()
+        .filter(Value::is_object)
+}
+
+/// Longest provider explanation logged for a refused request.
+const REFUSAL_DETAIL_CHARS: usize = 300;
+
+/// A refused request's explanation: the `error.message` of a JSON error body
+/// when there is one, otherwise the body itself, without control characters
+/// and bounded.
+fn refusal_detail(body: &str) -> String {
+    let message = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        value
+            .pointer("/error/message")
+            .or_else(|| value.get("detail"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    message
+        .as_deref()
+        .unwrap_or(body)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(REFUSAL_DETAIL_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 fn push_claude(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
     if blocks.is_empty() {
         return;
@@ -1122,6 +1213,96 @@ mod tests {
         let turn = parse_codex_sse(raw).expect("valid event stream");
         assert_eq!(turn.content.as_deref(), Some("Hello"));
         assert_eq!(turn.tool_calls[0].name, "positions");
+    }
+
+    #[test]
+    fn a_structured_claude_turn_names_its_tool_without_compelling_it() {
+        let credential = SubscriptionCredential {
+            provider: SubscriptionProvider::ClaudeCode,
+            access_token: "token".into(),
+            id_token: String::new(),
+            refresh_token: String::new(),
+            account_id: None,
+            account_uuid: None,
+            organization_uuid: None,
+            scopes: vec![],
+            account_label: None,
+            expires_at_unix: None,
+        };
+        let mut body = claude_body(
+            "claude-sonnet-5-5",
+            "Decide.",
+            &[],
+            &[],
+            uuid::Uuid::nil(),
+            &credential,
+        );
+        require_claude_tool(&mut body, "veyra_agent_step");
+        assert_eq!(body["tool_choice"], json!({"type":"auto"}));
+        assert!(body.get("thinking").is_some());
+        assert!(body.get("context_management").is_some());
+        let system = body["system"].as_array().expect("system blocks");
+        assert_eq!(system[2]["text"], "Decide.");
+        assert_eq!(
+            system[3]["text"],
+            "Answer only by calling the veyra_agent_step tool with the complete answer."
+        );
+    }
+
+    #[test]
+    fn a_structured_answer_is_the_named_call_or_json_text() {
+        let turn = |content: Option<&str>, calls: Vec<ToolCall>| AssistantTurn {
+            content: content.map(str::to_owned),
+            tool_calls: calls,
+        };
+        let call = |name: &str| ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: json!({"action":"hold"}),
+        };
+        assert_eq!(
+            structured_answer(turn(Some("thinking aloud"), vec![call("step")]), "step"),
+            Some(json!({"action":"hold"}))
+        );
+        assert_eq!(
+            structured_answer(turn(Some(r#" {"action":"open"} "#), vec![]), "step"),
+            Some(json!({"action":"open"}))
+        );
+        assert_eq!(
+            structured_answer(
+                turn(Some("```json\n{\"action\":\"close\"}\n```"), vec![]),
+                "step"
+            ),
+            Some(json!({"action":"close"}))
+        );
+        assert_eq!(
+            structured_answer(turn(Some("I would hold."), vec![]), "step"),
+            None
+        );
+        assert_eq!(
+            structured_answer(turn(Some("[1, 2]"), vec![]), "step"),
+            None
+        );
+        assert_eq!(
+            structured_answer(turn(None, vec![call("other")]), "step"),
+            None
+        );
+    }
+
+    #[test]
+    fn refusals_explain_themselves_briefly() {
+        assert_eq!(
+            refusal_detail(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"Thinking may not be enabled when tool_choice forces tool use."}}"#
+            ),
+            "Thinking may not be enabled when tool_choice forces tool use."
+        );
+        assert_eq!(
+            refusal_detail(r#"{"detail":"Unsupported model"}"#),
+            "Unsupported model"
+        );
+        assert_eq!(refusal_detail("line one\nline two"), "line one line two");
+        assert_eq!(refusal_detail(&"x".repeat(900)).len(), REFUSAL_DETAIL_CHARS);
     }
 
     #[test]

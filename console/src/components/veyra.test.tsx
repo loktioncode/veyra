@@ -166,7 +166,8 @@ function deferred<T>() {
 
 /** The value cell beside a label in a label/value grid. */
 function valueOf(label: string): HTMLElement {
-  const term = screen.getByText(label, { selector: 'dt' })
+  // A hinted label carries its tip inside the term, so match the label text alone.
+  const term = screen.getByText((_, element) => element?.tagName === 'DT' && element.firstChild?.textContent === label)
   return term.nextElementSibling as HTMLElement
 }
 
@@ -432,6 +433,34 @@ describe('AutopilotPanel', () => {
     expect(valueOf('Calls per hour').textContent).toBe('—')
   })
 
+  it('shows forecast usage and the scored record, or that forecasts are off', () => {
+    const bands = (inside: number) => ({ below_p10: (1 - inside) / 2, inside, above_p90: (1 - inside) / 2 })
+    const { rerender } = render(
+      <AutopilotPanel
+        status={autopilot}
+        forecastUsage={{
+          calls: 57,
+          failures: 2,
+          inputTokens: 161_374,
+          record: { scored: 41, high: bands(0.8), low: bands(0.7), close: bands(0.9), close_direction_right: 0.54 },
+        }}
+      />,
+    )
+    expect(valueOf('Forecast calls').textContent).toBe('57 · 2 failed')
+    expect(valueOf('Forecast calls').className).toBe('tone-warn')
+    expect(valueOf('Forecast tokens').textContent).toBe('161.4k')
+    expect(valueOf('Forecast record').textContent).toBe('41 scored · 80% in range · 54% direction')
+    expect(screen.getByLabelText('About Forecast record')).toBeTruthy()
+
+    rerender(<AutopilotPanel status={autopilot} forecastUsage={{ calls: 57, failures: 0, inputTokens: 161_374, record: null }} />)
+    expect(valueOf('Forecast record').textContent).toBe('Not scored yet')
+    expect(valueOf('Forecast record').className).toBe('tone-faint')
+
+    rerender(<AutopilotPanel status={autopilot} forecastUsage={null} />)
+    expect(valueOf('Forecast calls').textContent).toBe('Off')
+    expect(screen.queryByLabelText('About Forecast record')).toBeNull()
+  })
+
   it('names the models last asked and last answering', () => {
     render(
       <AutopilotPanel
@@ -634,7 +663,7 @@ describe('RiskPanel', () => {
     expect(valueOf('Duplicate window').textContent).toBe('60s')
     expect(valueOf('Max risk').textContent).toBe('12% per trade')
     expect(valueOf('Loss brakes').textContent).toBe('Day 10% · peak 25%')
-    expect(valueOf('Net USD cap').textContent).toBe('0.01 lots')
+    expect(valueOf('Currency cap').textContent).toBe('0.01 lots')
     expect(valueOf('News blackout').textContent).toBe('30m')
     expect(valueOf('Stop floor').textContent).toBe('0.25× ATR')
     expect(valueOf('Judge outage').textContent).toBe('Pauses decisions')
@@ -659,7 +688,7 @@ describe('RiskPanel', () => {
         status={status}
       />,
     )
-    for (const label of ['Max risk', 'Loss brakes', 'Net USD cap', 'News blackout', 'Stop floor']) {
+    for (const label of ['Max risk', 'Loss brakes', 'Currency cap', 'News blackout', 'Stop floor']) {
       expect(valueOf(label).textContent).toBe('Off')
     }
     rerender(<RiskPanel policy={{ ...status.risk_policy, maxDailyLossPercent: 0 }} status={status} />)
@@ -712,7 +741,7 @@ describe('RiskPanel editing', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
     fireEvent.change(screen.getByLabelText('Max open orders'), { target: { value: '7' } })
-    fireEvent.change(screen.getByLabelText('Net USD cap (lots)'), { target: { value: '0.02' } })
+    fireEvent.change(screen.getByLabelText('Currency cap (lots)'), { target: { value: '0.02' } })
     fireEvent.change(screen.getByLabelText('News blackout (minutes)'), { target: { value: '45' } })
     fireEvent.change(screen.getByLabelText('Min stop (× ATR)'), { target: { value: '0.75' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))

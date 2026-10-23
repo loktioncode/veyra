@@ -338,6 +338,7 @@ pub fn prepare(provider: SubscriptionProvider) -> Result<PendingAuthorization> {
                     "scope",
                     "openid profile email offline_access api.connectors.read api.connectors.invoke",
                 )
+                .append_pair("id_token_add_organizations", "true")
                 .append_pair("codex_cli_simplified_flow", "true")
                 .append_pair("originator", CODEX_ORIGINATOR)
                 .append_pair("redirect_uri", CODEX_REDIRECT_URI);
@@ -431,6 +432,81 @@ fn validate_callback_url(provider: SubscriptionProvider, url: &reqwest::Url) -> 
     Ok(())
 }
 
+/// Body of Claude's code exchange. Claude's token endpoint expects the
+/// authorization's `state` alongside the PKCE verifier (as Claude Code sends
+/// it); without it the exchange is refused.
+fn claude_exchange_body(pending: &PendingAuthorization, code: &str) -> serde_json::Value {
+    serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": CLAUDE_CLIENT_ID,
+        "code": code,
+        "redirect_uri": CLAUDE_REDIRECT_URI,
+        "code_verifier": pending.verifier,
+        "state": pending.state,
+    })
+}
+
+/// Longest provider explanation passed on in a refusal.
+const REFUSAL_DETAIL_CHARS: usize = 160;
+
+/// Plain-language reason for a refused code exchange, built from the
+/// provider's own error fields (OAuth `error`/`error_description`, or an
+/// `error` object's `message`/`type`). The code itself is never repeated, and
+/// an `invalid_grant` refusal says what usually causes it.
+fn exchange_refusal(provider: SubscriptionProvider, status: u16, body: &str, code: &str) -> String {
+    let service = match provider {
+        SubscriptionProvider::Codex => "OpenAI",
+        SubscriptionProvider::ClaudeCode => "Claude",
+    };
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let text = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    let (kind, description) = match parsed.as_ref().and_then(|body| body.get("error")) {
+        Some(serde_json::Value::Object(error)) => (
+            text(error.get("code")).or_else(|| text(error.get("type"))),
+            text(error.get("message")),
+        ),
+        Some(error) => (
+            text(Some(error)),
+            text(
+                parsed
+                    .as_ref()
+                    .and_then(|body| body.get("error_description")),
+            ),
+        ),
+        None => (None, None),
+    };
+    let mut detail = match (&kind, &description) {
+        (Some(kind), Some(description)) => format!("{kind}: {description}"),
+        (Some(only), None) | (None, Some(only)) => only.clone(),
+        (None, None) => String::new(),
+    };
+    if !code.is_empty() {
+        detail = detail.replace(code, "…");
+    }
+    let detail: String = detail
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(REFUSAL_DETAIL_CHARS)
+        .collect();
+    let mut reason = format!("{service} refused the sign-in code (HTTP {status})");
+    if !detail.is_empty() {
+        reason.push_str(": ");
+        reason.push_str(&detail);
+    }
+    if kind.as_deref() == Some("invalid_grant") || detail.contains("invalid_grant") {
+        reason.push_str(
+            ". Codes work once and expire within minutes: start the connection again and paste the new code straight away",
+        );
+    }
+    reason
+}
+
 /// Exchanges an authorization code for an opaque subscription credential.
 pub async fn exchange(
     client: &reqwest::Client,
@@ -438,17 +514,41 @@ pub async fn exchange(
     code: &str,
 ) -> Result<SubscriptionCredential> {
     let response = match pending.provider {
-        SubscriptionProvider::Codex => client.post(format!("{CODEX_ISSUER}/oauth/token")).header("originator", CODEX_ORIGINATOR).form(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", CODEX_REDIRECT_URI), ("client_id", CODEX_CLIENT_ID), ("code_verifier", pending.verifier.as_str())]).send().await.context("Codex subscription exchange failed")?,
-        SubscriptionProvider::ClaudeCode => client.post(CLAUDE_TOKEN_URL).json(&serde_json::json!({"grant_type":"authorization_code","client_id":CLAUDE_CLIENT_ID,"code":code,"redirect_uri":CLAUDE_REDIRECT_URI,"code_verifier":pending.verifier})).send().await.context("Claude subscription exchange failed")?,
+        SubscriptionProvider::Codex => client
+            .post(format!("{CODEX_ISSUER}/oauth/token"))
+            .header("originator", CODEX_ORIGINATOR)
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", CODEX_REDIRECT_URI),
+                ("client_id", CODEX_CLIENT_ID),
+                ("code_verifier", pending.verifier.as_str()),
+            ])
+            .send()
+            .await
+            .context("could not reach OpenAI's sign-in service")?,
+        SubscriptionProvider::ClaudeCode => client
+            .post(CLAUDE_TOKEN_URL)
+            .json(&claude_exchange_body(pending, code))
+            .send()
+            .await
+            .context("could not reach Claude's sign-in service")?,
     };
+    // Status first: a refusal is often not JSON, and reading it as JSON
+    // would report a malformed answer instead of the refusal.
     let status = response.status();
-    let body: serde_json::Value = response
-        .json()
+    let text = response
+        .text()
         .await
-        .context("subscription exchange response malformed")?;
+        .context("the sign-in service's answer could not be read")?;
     if !status.is_success() {
-        bail!("subscription exchange rejected ({status})")
+        bail!(
+            "{}",
+            exchange_refusal(pending.provider, status.as_u16(), &text, code)
+        )
     }
+    let body: serde_json::Value =
+        serde_json::from_str(&text).context("the sign-in service's answer was not JSON")?;
     let access_token = body
         .get("access_token")
         .and_then(|v| v.as_str())
@@ -540,6 +640,76 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_exchange_carries_state_and_codex_asks_for_organizations() {
+        let claude = prepare(SubscriptionProvider::ClaudeCode).expect("claude flow");
+        let body = claude_exchange_body(&claude, "the-code");
+        assert_eq!(body["state"], claude.state.as_str());
+        assert_eq!(body["code_verifier"], claude.verifier.as_str());
+        assert_eq!(body["code"], "the-code");
+        assert_eq!(body["grant_type"], "authorization_code");
+        assert_eq!(body["redirect_uri"], CLAUDE_REDIRECT_URI);
+
+        let codex = prepare(SubscriptionProvider::Codex).expect("codex flow");
+        assert!(
+            codex
+                .authorize_url
+                .contains("id_token_add_organizations=true")
+        );
+    }
+
+    #[test]
+    fn refused_exchanges_explain_themselves_without_the_code() {
+        let oauth = exchange_refusal(
+            SubscriptionProvider::ClaudeCode,
+            400,
+            r#"{"error":"invalid_grant","error_description":"Invalid code abc123 or verifier"}"#,
+            "abc123",
+        );
+        assert!(oauth.starts_with("Claude refused the sign-in code (HTTP 400): invalid_grant: Invalid code … or verifier"), "{oauth}");
+        assert!(oauth.contains("start the connection again"));
+        assert!(!oauth.contains("abc123"));
+
+        let object = exchange_refusal(
+            SubscriptionProvider::Codex,
+            401,
+            r#"{"error":{"message":"Token exchange failed","type":"invalid_request_error","code":"token_expired"}}"#,
+            "zzz",
+        );
+        assert_eq!(
+            object,
+            "OpenAI refused the sign-in code (HTTP 401): token_expired: Token exchange failed"
+        );
+
+        let typed = exchange_refusal(
+            SubscriptionProvider::ClaudeCode,
+            400,
+            r#"{"type":"error","error":{"type":"invalid_grant","message":"expired"}}"#,
+            "zzz",
+        );
+        assert!(
+            typed.contains("invalid_grant: expired") && typed.contains("Codes work once"),
+            "{typed}"
+        );
+
+        let html = exchange_refusal(
+            SubscriptionProvider::Codex,
+            403,
+            "<html>blocked</html>",
+            "zzz",
+        );
+        assert_eq!(html, "OpenAI refused the sign-in code (HTTP 403)");
+
+        let long = exchange_refusal(
+            SubscriptionProvider::Codex,
+            400,
+            &format!(r#"{{"error":"bad\n{}"}}"#, "x".repeat(400)),
+            "",
+        );
+        assert!(!long.contains('\n'));
+        assert!(long.len() < 260, "{}", long.len());
+    }
 
     #[test]
     fn prepared_flow_has_pkce_and_provider_endpoint() {

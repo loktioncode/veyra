@@ -67,6 +67,7 @@ const FIELD_ORDER = [
   'outcome',
   'rationale',
   'judgements',
+  'forecast',
   'tool',
   'result',
   'step',

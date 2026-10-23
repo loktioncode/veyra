@@ -11,6 +11,7 @@ use veyra_service::audit::{AuditEvent, AuditKind, AuditRuntime, AuditTrail};
 use veyra_service::broker::{BrokerRuntime, BrokerSettings};
 use veyra_service::calendar::{CalendarRuntime, CalendarSettings};
 use veyra_service::credential::CredentialVault;
+use veyra_service::forecast::{ForecastRuntime, ForecastSettings};
 use veyra_service::jev::{JevRuntime, JevSettings, OpenAiSettings};
 use veyra_service::judge::JudgeControl;
 use veyra_service::logs::{self, LogBuffer};
@@ -97,6 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // Range forecasts are optional model inputs: absent configuration leaves
+    // the model without them, and a partial section fails startup.
+    let forecast = match ForecastSettings::from_env()? {
+        Some(settings) => Some(ForecastRuntime::from_settings(&settings)?),
+        None => None,
+    };
+
     // The operator's judge choice: OpenAI Decisions layered over the
     // configured Jev, resumed only while its key, a passing test, and the Jev
     // fallback all still exist. Unreadable saved state fails startup.
@@ -148,9 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_runtime_config(runtime_config)
         .with_credential_vault(vault)
         .with_market(market)
+        .with_market_cache()
         .with_calendar(calendar)
         .with_autopilot(autopilot)
         .with_jev(jev)
+        .with_forecast(forecast)
         .with_judge_control(Some(judge_control))
         .with_logs(logs)
         .with_runtime_state(runtime_state.clone())
@@ -440,6 +450,17 @@ async fn restore_runtime_state(state: &AppState, runtime: &RuntimeState) {
     {
         tracing::warn!(%error, "stored judge usage is unusable; starting from zero");
     }
+    if let Some(value) = runtime.load(StateKey::ForecastUsage).await
+        && let Some(forecast) = state.forecast()
+        && let Err(error) = forecast.restore_state(&value)
+    {
+        tracing::warn!(%error, "stored forecast usage is unusable; starting from zero");
+    }
+    if let Some(value) = runtime.load(StateKey::ForecastBook).await
+        && let Err(error) = state.forecasts().restore_state(&value)
+    {
+        tracing::warn!(%error, "stored forecast record is unusable; starting a new one");
+    }
     if let Some(value) = runtime.load(StateKey::ModelBudget).await
         && let Some(model) = state.model()
         && let Err(error) = model.restore_state(&value)
@@ -477,6 +498,15 @@ async fn persist_runtime_state(state: &AppState, runtime: &RuntimeState) {
         runtime
             .save(StateKey::JevUsage, &jev.state_snapshot())
             .await;
+    }
+    if let Some(forecast) = state.forecast() {
+        runtime
+            .save(StateKey::ForecastUsage, &forecast.state_snapshot())
+            .await;
+        match state.forecasts().state_snapshot() {
+            Ok(book) => runtime.save(StateKey::ForecastBook, &book).await,
+            Err(error) => tracing::warn!(%error, "forecast record not saved this cycle"),
+        }
     }
     if let Some(model) = state.model() {
         runtime

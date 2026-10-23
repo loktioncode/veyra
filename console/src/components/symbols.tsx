@@ -19,8 +19,10 @@ import { useSymbolCatalog } from '../lib/hooks'
 import { Button, ControlHead } from './form'
 import { Icon } from './ui'
 
-/** The service rotates through at most this many instruments. */
+/** Instruments the service rotates through when VEYRA_AUTOPILOT_MAX_SYMBOLS is empty. */
 export const MAX_AUTOPILOT_SYMBOLS = 16
+/** Most instruments the risk gate's allowlist holds (the service's own limit). */
+export const MAX_RISK_SYMBOLS = 64
 /** Rows per page; a broker can list thousands, so the list is paged rather than cut off. */
 export const PAGE_ROWS = 50
 /** The shape the service accepts for an instrument name. */
@@ -70,6 +72,7 @@ export function SymbolPicker({
   dirty = false,
   disabled = false,
   aside,
+  max = MAX_AUTOPILOT_SYMBOLS,
   onChange,
 }: {
   label: string
@@ -79,6 +82,8 @@ export function SymbolPicker({
   dirty?: boolean
   disabled?: boolean
   aside?: ReactNode
+  /** Most instruments that may be chosen; the service's VEYRA_AUTOPILOT_MAX_SYMBOLS. */
+  max?: number
   onChange: (value: string) => void
 }) {
   const { catalog, error, refreshing, reload, refresh } = useSymbolCatalog()
@@ -127,7 +132,7 @@ export function SymbolPicker({
   const first = current * PAGE_ROWS
   const shown = rows.slice(first, first + PAGE_ROWS)
 
-  const full = selected.length >= MAX_AUTOPILOT_SYMBOLS
+  const full = selected.length >= max
   const refused = selected.filter((name) => known.get(name.toLowerCase())?.riskAllowed === false)
 
   const toggle = (name: string) => {
@@ -150,6 +155,13 @@ export function SymbolPicker({
       const current = await api.riskPolicy()
       const have = new Set(current.symbols.map((name) => name.toLowerCase()))
       const add = refused.filter((name) => !have.has(name.toLowerCase()))
+      const room = MAX_RISK_SYMBOLS - current.symbols.length
+      if (add.length > room) {
+        setNote(
+          `The risk gate already allows ${current.symbols.length} of its ${MAX_RISK_SYMBOLS} instruments, so ${add.length} more will not fit. Remove some from Risk → allowed instruments first.`,
+        )
+        return
+      }
       await api.updatePolicy({ symbols: [...current.symbols, ...add] })
       await reload()
       setNote(`Added ${add.join(', ')} to the risk gate's allowed instruments.`)
@@ -165,7 +177,7 @@ export function SymbolPicker({
   const status = catalog?.ready
     ? `${catalog.total.toLocaleString()} instruments from ${catalog.server}, loaded ${ageOf(catalog.fetchedAt)}`
     : outdated
-      ? 'The MetaTrader EA is too old to list instruments. Recompile VeyraProbe (version 1.27 or newer) and reload it on the chart.'
+      ? 'The MetaTrader EA is too old to list instruments. Recompile VeyraProbe (version 1.28 or newer) and reload it on the chart.'
       : catalog
         ? `Waiting for the terminal to list its instruments (${catalog.reason}).`
         : error
@@ -323,7 +335,7 @@ export function SymbolPicker({
 
           <div className="sym-foot">
             <span className={full ? 'tone-warn' : ''}>
-              {selected.length} of {MAX_AUTOPILOT_SYMBOLS} chosen
+              {selected.length} of {max} chosen
             </span>
             <span className="sym-foot-actions">
               <Button onClick={() => void refresh()} disabled={refreshing || disabled}>

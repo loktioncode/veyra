@@ -16,6 +16,7 @@ pub mod calendar;
 pub mod config;
 pub mod control;
 pub mod credential;
+pub mod forecast;
 pub mod jev;
 pub mod judge;
 pub mod ledger;
@@ -47,6 +48,7 @@ use audit::AuditRuntime;
 use broker::BrokerRuntime;
 use calendar::CalendarRuntime;
 use config::ServiceConfig;
+use forecast::{ForecastBook, ForecastRuntime};
 use jev::JevRuntime;
 use logs::LogBuffer;
 use market::MarketRuntime;
@@ -80,6 +82,10 @@ pub struct AppState {
     credential_vault: Option<crate::credential::CredentialVault>,
     subscription_auth: crate::subscription_auth::SubscriptionAuthState,
     jev: Option<JevRuntime>,
+    /// Price-range forecaster, when one is configured (see [`crate::forecast`]).
+    forecast: Option<ForecastRuntime>,
+    /// Held, waiting, and scored forecasts behind the forecast record.
+    forecasts: Arc<ForecastBook>,
     /// Operator choice of judge (TypeSafe or OpenAI with Jev fallback).
     judge_control: Option<crate::judge::JudgeControl>,
     audit: Option<AuditRuntime>,
@@ -95,6 +101,7 @@ pub struct AppState {
     entry_watch: Arc<crate::trading::autopilot::EntryWatch>,
     judgements: Arc<crate::trading::autopilot::JudgementCache>,
     review_watch: Arc<crate::trading::autopilot::ReviewWatch>,
+    loss_watch: Arc<crate::trading::autopilot::LossWatch>,
     weekend_watch: Arc<crate::trading::autopilot::ReviewWatch>,
     decision_health: Arc<crate::trading::autopilot::DecisionHealth>,
     rotation: Arc<AtomicUsize>,
@@ -130,6 +137,8 @@ impl AppState {
             credential_vault: None,
             subscription_auth: crate::subscription_auth::SubscriptionAuthState::new(),
             jev: None,
+            forecast: None,
+            forecasts: Arc::new(ForecastBook::default()),
             judge_control: None,
             audit: None,
             ledger: None,
@@ -142,6 +151,7 @@ impl AppState {
             entry_watch: Arc::new(crate::trading::autopilot::EntryWatch::default()),
             judgements: Arc::new(crate::trading::autopilot::JudgementCache::default()),
             review_watch: Arc::new(crate::trading::autopilot::ReviewWatch::default()),
+            loss_watch: Arc::new(crate::trading::autopilot::LossWatch::default()),
             weekend_watch: Arc::new(crate::trading::autopilot::ReviewWatch::default()),
             decision_health: Arc::new(crate::trading::autopilot::DecisionHealth::default()),
             rotation: Arc::new(AtomicUsize::new(0)),
@@ -167,6 +177,18 @@ impl AppState {
     /// Attaches the configured market-data integration, if any.
     pub fn with_market(mut self, market: Option<MarketRuntime>) -> Self {
         self.market = market;
+        self
+    }
+
+    /// Puts the read-through market cache (`market::cache`) in front of the
+    /// configured feed, placing bar closes with this state's broker-clock
+    /// memory. Production calls this once at startup, after `with_market`;
+    /// tests that script a feed's answers tick by tick leave it off.
+    pub fn with_market_cache(mut self) -> Self {
+        let memory = self.terminal_memory.clone();
+        self.market = self
+            .market
+            .map(|market| market.cached(Arc::new(move || memory.offset_secs())));
         self
     }
 
@@ -254,6 +276,12 @@ impl AppState {
     /// Attaches the configured judgement integration, if any.
     pub fn with_jev(mut self, jev: Option<JevRuntime>) -> Self {
         self.jev = jev;
+        self
+    }
+
+    /// Attaches the configured forecaster, if any.
+    pub fn with_forecast(mut self, forecast: Option<ForecastRuntime>) -> Self {
+        self.forecast = forecast;
         self
     }
 
@@ -368,6 +396,12 @@ impl AppState {
         &self.review_watch
     }
 
+    /// Loss levels each open position has been reviewed at (see
+    /// [`crate::trading::autopilot::LossWatch`]).
+    pub fn loss_watch(&self) -> &Arc<crate::trading::autopilot::LossWatch> {
+        &self.loss_watch
+    }
+
     /// Friday close each open position was last given a weekend verdict on;
     /// the same watch shape, keyed by the close instant rather than a candle.
     pub fn weekend_watch(&self) -> &Arc<crate::trading::autopilot::ReviewWatch> {
@@ -458,6 +492,16 @@ impl AppState {
     /// [`crate::judge`]); callers need not know which one it is.
     pub fn jev(&self) -> Option<&JevRuntime> {
         self.jev.as_ref()
+    }
+
+    /// Returns the configured forecaster, if any.
+    pub fn forecast(&self) -> Option<&ForecastRuntime> {
+        self.forecast.as_ref()
+    }
+
+    /// Held, waiting, and scored forecasts, shared by every clone of the state.
+    pub fn forecasts(&self) -> &Arc<ForecastBook> {
+        &self.forecasts
     }
 
     /// Operator judge selection, when the service was started with one.

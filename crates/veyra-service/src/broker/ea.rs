@@ -517,8 +517,9 @@ impl EaLink {
         }
     }
 
-    /// Marks timed-out commands as failed and returns the oldest pending
-    /// command for delivery, including its request payload when one exists.
+    /// Marks timed-out commands as failed and returns the next pending
+    /// command for delivery, including its request payload when one exists:
+    /// the oldest of the most urgent kind (see [`delivery_rank`]).
     fn deliverable(&self) -> Option<(CommandId, CommandKind, Option<CommandRequest>)> {
         let timeout = self.command_timeout;
         self.with_commands(|queue| {
@@ -532,9 +533,12 @@ impl EaLink {
                     };
                 }
             }
+            // `min_by_key` keeps the first of equal ranks, so each rank stays
+            // in issue order.
             queue
                 .iter()
-                .find(|command| matches!(command.state, CommandState::Pending))
+                .filter(|command| matches!(command.state, CommandState::Pending))
+                .min_by_key(|command| delivery_rank(command.kind))
                 .map(|command| (command.id, command.kind, command.request.clone()))
         })
     }
@@ -1013,6 +1017,28 @@ impl BrokerLink for EaLink {
         EaLink::set_audit(self, audit)
     }
 }
+
+/// Delivery order across command kinds; lower goes first.
+///
+/// The terminal takes one command per poll, so a burst of reads (a decision
+/// sweep's candles and contracts, an operator's chart) would otherwise sit in
+/// front of an order, a close, or a stop move on money already at risk. Money
+/// moves first, then the account view position management depends on, then
+/// market reads.
+fn delivery_rank(kind: CommandKind) -> u8 {
+    match kind {
+        CommandKind::CloseOrder
+        | CommandKind::ModifyOrder
+        | CommandKind::OpenOrder
+        | CommandKind::OrderCheck => 0,
+        CommandKind::AccountSnapshot | CommandKind::Ping => 1,
+        CommandKind::Rates
+        | CommandKind::SymbolSpec
+        | CommandKind::OrderHistory
+        | CommandKind::ListSymbols => 2,
+    }
+}
+
 #[post("/ea/poll")]
 /// Accepts one EA poll after authenticating the shared token.
 ///
@@ -1547,6 +1573,51 @@ mod tests {
         );
         assert!(broken(&|p| p.candles[0].high = 1.0).validate().is_err());
         assert!(broken(&|p| p.candles[0].volume = -1).validate().is_err());
+    }
+
+    #[test]
+    fn money_moves_are_delivered_before_queued_reads() {
+        let link = || {
+            EaLink::new(
+                EaToken::parse("test-token-1234567890").expect("token"),
+                Duration::from_secs(10),
+                Duration::from_secs(15),
+            )
+        };
+        let symbol = BrokerSymbol::parse("EURUSD").expect("symbol");
+
+        // A sweep's reads were queued first; the close still goes first.
+        let busy = link();
+        busy.enqueue_rates(RatesRequest::new(&symbol, 240, 2).expect("request"));
+        busy.enqueue_symbol_spec(SymbolSpecRequest::new(&symbol));
+        busy.enqueue(CommandKind::AccountSnapshot);
+        let close = busy.enqueue_close(CloseOrderRequest::new(42, 77_041));
+        let (delivered, kind, _) = busy.deliverable().expect("pending command");
+        assert_eq!((delivered, kind), (close, CommandKind::CloseOrder));
+
+        // Without a money move, the account view goes before market reads.
+        let reads = link();
+        reads.enqueue_rates(RatesRequest::new(&symbol, 240, 2).expect("request"));
+        reads.enqueue_symbol_spec(SymbolSpecRequest::new(&symbol));
+        let ping = reads.enqueue(CommandKind::Ping);
+        assert_eq!(reads.deliverable().expect("pending").0, ping);
+
+        // Reads of one rank keep their issue order.
+        let fifo = link();
+        let first = fifo.enqueue_rates(RatesRequest::new(&symbol, 240, 2).expect("request"));
+        fifo.enqueue_symbol_spec(SymbolSpecRequest::new(&symbol));
+        assert_eq!(fifo.deliverable().expect("pending").0, first);
+
+        for (kind, rank) in [
+            (CommandKind::OpenOrder, 0),
+            (CommandKind::OrderCheck, 0),
+            (CommandKind::ModifyOrder, 0),
+            (CommandKind::Ping, 1),
+            (CommandKind::OrderHistory, 2),
+            (CommandKind::ListSymbols, 2),
+        ] {
+            assert_eq!(super::delivery_rank(kind), rank, "{kind:?}");
+        }
     }
 
     #[test]

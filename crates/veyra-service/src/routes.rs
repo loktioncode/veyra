@@ -55,6 +55,11 @@ struct StatusResponse {
     /// Cumulative judge usage (calls, failures, reported tokens, and calls
     /// the TypeSafe fallback answered for a selected OpenAI primary).
     jev_usage: Option<serde_json::Value>,
+    /// Active range forecaster, when one is configured.
+    forecast_provider: Option<&'static str>,
+    /// Cumulative forecast usage (calls, failures, billed input tokens) and
+    /// the scored record for the autopilot's timeframe.
+    forecast_usage: Option<serde_json::Value>,
     /// Effective risk gate policy; always present (the gate never sleeps).
     risk_policy: serde_json::Value,
     /// Whether decisions are completing. A provider that refuses every request
@@ -229,6 +234,19 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
             "fallbacks": usage.fallbacks
         })
     });
+    let forecast_provider = state.forecast().map(|runtime| runtime.provider().as_str());
+    let forecast_usage = state.forecast().map(|runtime| {
+        let usage = runtime.usage();
+        let record = state
+            .autopilot()
+            .and_then(|settings| state.forecasts().record(settings.timeframe()));
+        json!({
+            "calls": usage.calls,
+            "failures": usage.failures,
+            "inputTokens": usage.input_tokens,
+            "record": record
+        })
+    });
     let last_entry = last_entry_decision(&state).await;
     let next_check_ms = next_entry_check_ms(&state);
     let persistence = state.audit().map(|runtime| runtime.provider().as_str());
@@ -252,6 +270,8 @@ pub async fn status(state: Data<AppState>) -> HttpResponse {
         autopilot,
         model_budget,
         jev_usage,
+        forecast_provider,
+        forecast_usage,
         risk_policy: state.risk().policy().summary(),
         decisions: {
             // Named for the concept, not `health`: the `/health` route macro
@@ -489,7 +509,7 @@ pub(crate) async fn account_facts_for_draft(
     // broker lookup can take seconds; reading the book last minimizes the
     // window between dynamic risk facts and final order admission.
     let spec = if let Some(market) = state.market() {
-        market.feed().symbol_spec(draft.symbol()).await.ok()
+        market.feed().fresh_symbol_spec(draft.symbol()).await.ok()
     } else {
         None
     };

@@ -1,6 +1,6 @@
 //! Autonomous trader loop.
 //!
-//! One tick gathers validated market data, optionally asks Jev for calibrated
+//! One tick gathers validated market data, optionally asks Jev for trend
 //! judgements, asks the configured decision engine for a structured proposal,
 //! and routes it through the deterministic risk gate and the same staged
 //! execution path the control surface uses. The loop never widens behavior:
@@ -50,25 +50,34 @@ use crate::control::{
     StagedClose, StagedExecution, StagedModify, queue_staged_close, queue_staged_modify,
     queue_staged_order,
 };
+use crate::forecast::RangeRequest;
 use crate::jev::{
     Answer, ChoiceOptions, Instructions, JevRequest, JevRuntime, NoulCriteria, Question,
     ScoreLevels, State as JevState,
 };
 use crate::market::{Candle, CandleRequest, CandleSeries, Timeframe};
 use crate::model::ModelTier;
+use crate::risk::valuation;
 use crate::risk::window::WeekendPrep;
 use crate::risk::{AccountFacts, RiskPolicy, WeekendPositions};
 use crate::trading::agent::{self, AgentDecision, AgentMode, AgentSession};
 use crate::trading::contract;
-use crate::trading::intent::TradeIntentDraft;
+use crate::trading::intent::{Side, TradeIntentDraft};
+use crate::trading::judge_record::JudgeRecord;
 use crate::trading::pipeline::{PipelineError, PipelineOutcome};
 
 /// Instrument the autopilot trades when none is configured: gold against USD.
 const DEFAULT_SYMBOL: &str = "XAUUSD";
 /// Default proposal cadence in seconds.
 const DEFAULT_INTERVAL_SECS: u64 = 300;
-/// Largest number of instruments one autopilot rotation accepts.
-const MAX_SYMBOLS: usize = 16;
+/// Instruments one autopilot rotation accepts when
+/// `VEYRA_AUTOPILOT_MAX_SYMBOLS` is empty.
+const DEFAULT_MAX_SYMBOLS: usize = 16;
+/// Highest accepted `VEYRA_AUTOPILOT_MAX_SYMBOLS`: the risk gate's own
+/// allowlist ceiling, so the rotation can never outgrow what the gate admits.
+/// Every instrument costs terminal round trips and prompt space on every
+/// tick, which is why the default stays well below it.
+const MAX_SYMBOLS_CEILING: usize = 64;
 /// Smallest accepted cadence: frequent enough to act, slow enough to be sane.
 const MIN_INTERVAL_SECS: u64 = 30;
 /// Largest accepted cadence.
@@ -79,6 +88,9 @@ const DEFAULT_BARS: u16 = 48;
 const MIN_BARS: u16 = 10;
 /// How many recent candles are embedded in the model input.
 const RECENT_CANDLES: usize = 12;
+/// Volume used to probe the exposure cap for an instrument whose contract
+/// does not report its minimum lot.
+const SMALLEST_PROBE_LOTS: f64 = 0.01;
 /// True-range window used for the ATR context handed to the model.
 const ATR_PERIOD: usize = 14;
 /// How far ahead the model sees scheduled events, in seconds.
@@ -226,6 +238,7 @@ impl AutopilotSettings {
         let enabled_raw = optional(&mut source, "VEYRA_AUTOPILOT_ENABLED");
         let symbol_raw = optional(&mut source, "VEYRA_AUTOPILOT_SYMBOL");
         let symbols_raw = optional(&mut source, "VEYRA_AUTOPILOT_SYMBOLS");
+        let max_symbols_raw = optional(&mut source, "VEYRA_AUTOPILOT_MAX_SYMBOLS");
         let timeframe_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIMEFRAME");
         let bars_raw = optional(&mut source, "VEYRA_AUTOPILOT_BARS");
         let tier_raw = optional(&mut source, "VEYRA_AUTOPILOT_TIER");
@@ -262,8 +275,22 @@ impl AutopilotSettings {
                 reason: "set either VEYRA_AUTOPILOT_SYMBOL or VEYRA_AUTOPILOT_SYMBOLS, not both",
             });
         }
+        let max_symbols = match max_symbols_raw.as_str() {
+            "" => DEFAULT_MAX_SYMBOLS,
+            other => {
+                let invalid = || ConfigError::InvalidEnvironmentVariable {
+                    name: "VEYRA_AUTOPILOT_MAX_SYMBOLS",
+                    reason: "must be an integer from 1 through 64",
+                };
+                let max = other.parse::<usize>().map_err(|_| invalid())?;
+                if !(1..=MAX_SYMBOLS_CEILING).contains(&max) {
+                    return Err(invalid());
+                }
+                max
+            }
+        };
         let symbols = if !symbols_raw.is_empty() {
-            parse_symbol_list(&symbols_raw)?
+            parse_symbol_list(&symbols_raw, max_symbols)?
         } else if !symbol_raw.is_empty() {
             vec![Symbol::parse(&symbol_raw).map_err(|_| {
                 ConfigError::InvalidEnvironmentVariable {
@@ -784,7 +811,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
     // no open position to quote from.
     let mut account = with_reference_prices(account, &markets);
 
-    // Calibrated judgements per candidate. They are advisory inputs, but a
+    // Jev's trend readings per candidate. They are advisory inputs, but a
     // configured judge that fails normally aborts the tick: no model call runs
     // on partial inputs. The owner can override that from the console, which
     // trades on the model alone rather than pausing through a judge outage.
@@ -828,6 +855,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             }
         }
     }
+    let forecasts = range_forecasts(state, &markets).await;
 
     // One position review per tick, rotating through the open book; a close
     // ends the tick, a hold falls through so entries can still be considered.
@@ -917,6 +945,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             std::slice::from_ref(&position),
             Some(prep),
             "autopilot_weekend",
+            None,
         )
         .await;
         if !matches!(outcome, TickOutcome::Held) {
@@ -926,7 +955,71 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
         reviewed_hold = true;
     }
 
+    // Loss checkpoint: a position that has turned against its entry by a
+    // review level is asked now, with its trajectory, instead of at the next
+    // closed candle. It takes this tick's review, and marks the candle as
+    // reviewed so the same bars are not asked about again.
+    state
+        .loss_watch()
+        .retain(&managed.iter().map(|p| p.ticket).collect::<Vec<_>>());
+    let mut reviewed_loss = false;
     if !reviewed_weekend
+        && let Some((position, level, _)) = loss_review_target(state, &managed)
+        && matches!(
+            position_age_secs(server_time, position.opened_at),
+            Some(age) if age >= settings.min_hold().as_secs()
+        )
+        && let Some(series) = series_for_symbol(&markets, &position.symbol)
+        && let Some(risk) = state.stop_basis().risk(position.ticket)
+    {
+        let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+        state.loss_watch().record(position.ticket, level);
+        state.review_watch().record(position.ticket, candle_time);
+        let bars =
+            match CandleRequest::new(series.symbol().clone(), Timeframe::M15, LOSS_REVIEW_BARS) {
+                Ok(request) => match market.feed().candles(request).await {
+                    Ok(intraday) => intraday.candles().to_vec(),
+                    Err(error) => {
+                        tracing::warn!(%error, "loss review continues without intraday bars");
+                        Vec::new()
+                    }
+                },
+                Err(_) => Vec::new(),
+            };
+        let equity = snapshot.as_ref().map(|snapshot| snapshot.equity);
+        if let Some(path) = trajectory(&position, risk, equity, server_time, &bars) {
+            let engine = model.engine();
+            let session = AgentSession {
+                state,
+                engine: engine.as_ref(),
+                mode: AgentMode::Review,
+                markets: &markets,
+                account: &account,
+                judgements: &judgements,
+                tier: settings.tier(),
+                now: state.now(),
+            };
+            let outcome = review_positions(
+                state,
+                &settings,
+                &session,
+                series,
+                std::slice::from_ref(&position),
+                None,
+                "autopilot_loss_review",
+                Some(&path),
+            )
+            .await;
+            if !matches!(outcome, TickOutcome::Held) {
+                return outcome;
+            }
+            reviewed_loss = true;
+            reviewed_hold = true;
+        }
+    }
+
+    if !reviewed_weekend
+        && !reviewed_loss
         && let Some(position) = next_review_position(&managed, state.rotation())
         && matches!(
             position_age_secs(server_time, position.opened_at),
@@ -969,6 +1062,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             std::slice::from_ref(&position),
             position_weekend_context,
             "autopilot_review",
+            None,
         )
         .await;
         if !matches!(outcome, TickOutcome::Held) {
@@ -1016,7 +1110,18 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             atr: average_true_range(series, ATR_PERIOD),
         })
         .collect();
-    if settings.profit_harvest().is_some() {
+    if let Some(harvest) = settings.profit_harvest() {
+        // The position loop records closes on its own cadence, so a stop that
+        // lands just before this sweep may not be in the book yet. Recording
+        // them here first keeps a symbol stopped out moments ago off the menu
+        // instead of handing the model the same trade again.
+        if book_is_complete_and_fresh(state, &settings) {
+            state.profit_harvest_book().observe(
+                &managed_positions(state),
+                unix_secs(state.now()),
+                harvest.reentry_cooldown(),
+            );
+        }
         let pending = state.profit_harvest_book().pending_fresh_baselines();
         if !pending.is_empty() {
             let captured = state.entry_watch().record_symbols(&observations, &pending);
@@ -1083,6 +1188,15 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                 return TickOutcome::Unavailable { reason };
             }
         };
+        let judge_record = if judgements.is_empty() {
+            None
+        } else {
+            load_judge_record(state).await
+        };
+        let forecast_inputs = forecasts.as_deref().map(|per_symbol| ForecastInputs {
+            per_symbol,
+            record: state.forecasts().record(settings.timeframe()),
+        });
         let input = proposal_input(
             &entry_markets,
             &judgements,
@@ -1091,9 +1205,18 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
             &specs,
             &events,
             unix_secs(state.now()),
+            policy.max_net_factor_lots(),
+            judge_record.as_ref(),
+            forecast_inputs.as_ref(),
         );
-        let instructions =
-            proposal_instructions(state, &entry_markets, &account, state.jev().is_some());
+        let instructions = proposal_instructions(
+            state,
+            &entry_markets,
+            &account,
+            state.jev().is_some(),
+            judge_record.is_some(),
+            forecast_inputs.as_ref(),
+        );
         let engine = model.engine();
         let session = AgentSession {
             state,
@@ -1148,6 +1271,7 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                             DecisionContext {
                                 rationale,
                                 judgements: None,
+                                forecast: None,
                                 tool_names: Some(&tool_names),
                                 menu: Some(&menu),
                             },
@@ -1168,6 +1292,9 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                             DecisionContext {
                                 rationale,
                                 judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                                forecast: forecasts
+                                    .as_deref()
+                                    .and_then(|held| judgement_for_symbol(held, symbol.as_str())),
                                 tool_names: Some(&tool_names),
                                 menu: Some(&menu),
                             },
@@ -1183,6 +1310,9 @@ async fn tick_inner(state: &AppState, manage_positions: bool) -> TickOutcome {
                         let context = DecisionContext {
                             rationale,
                             judgements: judgement_for_symbol(&judgements, symbol.as_str()),
+                            forecast: forecasts
+                                .as_deref()
+                                .and_then(|held| judgement_for_symbol(held, symbol.as_str())),
                             tool_names: Some(&tool_names),
                             menu: Some(&menu),
                         };
@@ -1370,17 +1500,12 @@ pub async fn manage_open_positions(state: &AppState) -> TickOutcome {
         .unwrap_or(TickOutcome::Unchanged)
 }
 
-async fn manage_open_positions_after_link(
-    state: &AppState,
-    settings: &AutopilotSettings,
-) -> Option<TickOutcome> {
-    let broker = state.broker()?;
-    let managed = managed_positions(state);
-    let snapshot = broker.link().last_account();
-    let server_time = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.server_time)
-        .unwrap_or(0);
+/// Whether the latest venue book is complete and recent enough to learn from:
+/// an old or truncated snapshot could fabricate a close or a vanished ticket.
+fn book_is_complete_and_fresh(state: &AppState, settings: &AutopilotSettings) -> bool {
+    let Some(broker) = state.broker() else {
+        return false;
+    };
     let max_snapshot_age = Duration::from_secs(
         settings
             .interval()
@@ -1388,14 +1513,28 @@ async fn manage_open_positions_after_link(
             .saturating_mul(2)
             .max(MIN_INTERVAL_SECS),
     );
-    let snapshot_is_complete_and_fresh = snapshot
-        .as_ref()
+    broker
+        .link()
+        .last_account()
         .is_some_and(|snapshot| !snapshot.positions_truncated)
         && broker
             .link()
             .last_account_age(state.now())
-            .is_some_and(|age| age <= max_snapshot_age);
-    if !snapshot_is_complete_and_fresh {
+            .is_some_and(|age| age <= max_snapshot_age)
+}
+
+async fn manage_open_positions_after_link(
+    state: &AppState,
+    settings: &AutopilotSettings,
+) -> Option<TickOutcome> {
+    let broker = state.broker()?;
+    let managed = managed_positions(state);
+    let server_time = broker
+        .link()
+        .last_account()
+        .map(|snapshot| snapshot.server_time)
+        .unwrap_or(0);
+    if !book_is_complete_and_fresh(state, settings) {
         return None;
     }
 
@@ -1761,8 +1900,9 @@ fn judgement_for_symbol<'a>(judgements: &'a [(Symbol, Value)], symbol: &str) -> 
         .map(|(_, summary)| summary)
 }
 
-/// Parses a comma-separated symbol list: 1-16 distinct validated instruments.
-fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
+/// Parses a comma-separated symbol list: 1 to `max` distinct validated
+/// instruments.
+fn parse_symbol_list(raw: &str, max: usize) -> Result<Vec<Symbol>, ConfigError> {
     let invalid = |reason: &'static str| ConfigError::InvalidEnvironmentVariable {
         name: "VEYRA_AUTOPILOT_SYMBOLS",
         reason,
@@ -1790,8 +1930,10 @@ fn parse_symbol_list(raw: &str) -> Result<Vec<Symbol>, ConfigError> {
     if symbols.is_empty() {
         return Err(invalid("at least one symbol is required"));
     }
-    if symbols.len() > MAX_SYMBOLS {
-        return Err(invalid("at most 16 symbols may rotate"));
+    if symbols.len() > max {
+        return Err(invalid(
+            "lists more instruments than VEYRA_AUTOPILOT_MAX_SYMBOLS allows (16 when empty)",
+        ));
     }
     Ok(symbols)
 }
@@ -2292,6 +2434,177 @@ pub struct EntryWatch {
 /// leave nothing for the recovery.
 pub const ENTRY_RETRY_AFTER_SECS: i64 = 300;
 
+/// Losses, in R, at which an open position gets a loss review: a review
+/// outside the candle cadence, with the trade's trajectory in front of the
+/// analyst. Each level is asked once per position.
+const LOSS_REVIEW_LEVELS: [f64; 2] = [0.5, 0.75];
+
+/// Fifteen-minute bars fetched for a loss review: enough to cover a day.
+const LOSS_REVIEW_BARS: u16 = 96;
+
+/// Which loss levels each open position has been reviewed at.
+///
+/// The candle review asks once per closed bar, so a trade that turns against
+/// its entry early can run all the way to its stop before anyone looks again.
+/// This watch lets the management tick ask as soon as a position first
+/// crosses each level in [`LOSS_REVIEW_LEVELS`], and never twice for the same
+/// level. Process-lifetime: after a restart a position still below a level is
+/// asked once more, which is the safe direction.
+#[derive(Debug, Default)]
+pub struct LossWatch {
+    reviewed: std::sync::Mutex<std::collections::HashMap<i64, usize>>,
+}
+
+impl LossWatch {
+    /// The deepest level (index into [`LOSS_REVIEW_LEVELS`]) `r` has crossed
+    /// that this position has not been reviewed at; `None` when there is none.
+    pub fn due_level(&self, ticket: i64, r: f64) -> Option<usize> {
+        let crossed = LOSS_REVIEW_LEVELS
+            .iter()
+            .rposition(|level| r.is_finite() && r <= -level)?;
+        let Ok(reviewed) = self.reviewed.lock() else {
+            // A poisoned lock must not stop a losing position being asked.
+            return Some(crossed);
+        };
+        match reviewed.get(&ticket) {
+            Some(done) if *done >= crossed => None,
+            _ => Some(crossed),
+        }
+    }
+
+    /// Marks this position as reviewed at `level` (and every level above it).
+    pub fn record(&self, ticket: i64, level: usize) {
+        let Ok(mut reviewed) = self.reviewed.lock() else {
+            return;
+        };
+        let entry = reviewed.entry(ticket).or_insert(level);
+        *entry = (*entry).max(level);
+    }
+
+    /// Forgets tickets that are no longer open.
+    pub fn retain(&self, open: &[i64]) {
+        let Ok(mut reviewed) = self.reviewed.lock() else {
+            return;
+        };
+        reviewed.retain(|ticket, _| open.contains(ticket));
+    }
+}
+
+/// A position's progress in R: the move from entry in its favour divided by
+/// the entry risk, negative while it loses. `None` without a usable risk.
+fn r_multiple(position: &ManagedPosition, risk: f64) -> Option<f64> {
+    if !risk.is_finite() || risk <= 0.0 || position.entry <= 0.0 || position.current <= 0.0 {
+        return None;
+    }
+    let direction = match position.side {
+        ManagedSide::Buy => 1.0,
+        ManagedSide::Sell => -1.0,
+    };
+    Some((position.current - position.entry) * direction / risk)
+}
+
+/// How an open trade has travelled since entry, for a loss review. Built from
+/// the live position, its entry risk, and fifteen-minute bars; every figure is
+/// deterministic so the analyst judges the evidence rather than computing it.
+#[derive(Debug, Clone, PartialEq)]
+struct Trajectory {
+    /// Progress now, in R.
+    r_now: f64,
+    /// Best progress reached since entry, in R (from bar extremes).
+    best_r: f64,
+    /// Worst progress reached since entry, in R.
+    worst_r: f64,
+    /// Minutes since the position opened.
+    minutes_open: i64,
+    /// Change in R over the last hour of bars; negative is moving against.
+    last_hour_r: Option<f64>,
+    /// How many of the last four bars closed against the position.
+    bars_against: usize,
+    /// Open result in account currency (negative while losing).
+    open_result: f64,
+    /// Open result as a percentage of equity.
+    open_result_pct: Option<f64>,
+    /// Approximate result at the stop in account currency.
+    result_at_stop: Option<f64>,
+    /// Result at the stop as a percentage of equity.
+    result_at_stop_pct: Option<f64>,
+    /// Fifteen-minute bars since entry (at most the last twelve), oldest first.
+    bars: Vec<Candle>,
+}
+
+/// Builds the trajectory of `position` from its entry `risk`, the account
+/// `equity`, the broker's `server_time`, and fifteen-minute `bars`.
+fn trajectory(
+    position: &ManagedPosition,
+    risk: f64,
+    equity: Option<f64>,
+    server_time: i64,
+    bars: &[Candle],
+) -> Option<Trajectory> {
+    let r_now = r_multiple(position, risk)?;
+    let direction = match position.side {
+        ManagedSide::Buy => 1.0,
+        ManagedSide::Sell => -1.0,
+    };
+    // The bar holding the entry counts: it is where the trade started.
+    let since: Vec<Candle> = bars
+        .iter()
+        .filter(|bar| bar.time() + 900 > position.opened_at)
+        .cloned()
+        .collect();
+    let progress = |price: f64| (price - position.entry) * direction / risk;
+    let (mut best_r, mut worst_r) = (r_now, r_now);
+    for bar in &since {
+        for price in [bar.high(), bar.low()] {
+            best_r = best_r.max(progress(price));
+            worst_r = worst_r.min(progress(price));
+        }
+    }
+    let last_hour_r = since
+        .len()
+        .checked_sub(5)
+        .map(|start| progress(since[since.len() - 1].close()) - progress(since[start].close()));
+    let bars_against = since
+        .iter()
+        .rev()
+        .take(4)
+        .filter(|bar| (bar.close() - bar.open()) * direction < 0.0)
+        .count();
+    let open_result = position.net_profit();
+    let equity = equity.filter(|equity| equity.is_finite() && *equity > 0.0);
+    let result_at_stop = (r_now < -0.05).then(|| open_result / -r_now);
+    let percent = |amount: f64| equity.map(|equity| amount / equity * 100.0);
+    Some(Trajectory {
+        r_now,
+        best_r,
+        worst_r,
+        minutes_open: ((server_time - position.opened_at) / 60).max(0),
+        last_hour_r,
+        bars_against,
+        open_result,
+        open_result_pct: percent(open_result),
+        result_at_stop,
+        result_at_stop_pct: result_at_stop.and_then(percent),
+        bars: since.iter().rev().take(12).rev().cloned().collect(),
+    })
+}
+
+/// The open position most in need of a loss review: the deepest loser that
+/// has crossed a level it has not been reviewed at, with that level and its R.
+fn loss_review_target(
+    state: &AppState,
+    managed: &[ManagedPosition],
+) -> Option<(ManagedPosition, usize, f64)> {
+    managed
+        .iter()
+        .filter_map(|position| {
+            let r = r_multiple(position, state.stop_basis().risk(position.ticket)?)?;
+            let level = state.loss_watch().due_level(position.ticket, r)?;
+            Some((position.clone(), level, r))
+        })
+        .min_by(|left, right| left.2.total_cmp(&right.2))
+}
+
 /// The candle each open position was last reviewed on.
 ///
 /// A review asks whether the reason for holding still stands, and that reason
@@ -2571,15 +2884,30 @@ impl EntryWatch {
 }
 
 impl StopBasis {
-    /// Whether a stop within `tolerance` of `stop` was sent for `ticket` less
-    /// than [`STOP_RESEND_HOLD_SECS`] ago.
-    fn recently_attempted(&self, ticket: i64, stop: f64, tolerance: f64, now: i64) -> bool {
+    /// Whether a stop move to `stop` for `ticket` should wait.
+    ///
+    /// It waits for [`STOP_RESEND_HOLD_SECS`] after a move to the same level
+    /// (within `tolerance`), and after a move to any level the venue has not
+    /// applied: while the position's stop (`current_stop`) still sits
+    /// elsewhere, the last move was refused or is in flight, and a trailing
+    /// plan that shifts a little every tick would otherwise be refused again
+    /// every tick. Once a sent level shows on the position, the next move is
+    /// free to go.
+    fn recently_attempted(
+        &self,
+        ticket: i64,
+        stop: f64,
+        current_stop: f64,
+        tolerance: f64,
+        now: i64,
+    ) -> bool {
         let attempts = match self.attempts.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         attempts.get(&ticket).is_some_and(|(sent, at)| {
-            (sent - stop).abs() <= tolerance && now.saturating_sub(*at) < STOP_RESEND_HOLD_SECS
+            now.saturating_sub(*at) < STOP_RESEND_HOLD_SECS
+                && ((sent - stop).abs() <= tolerance || (sent - current_stop).abs() > tolerance)
         })
     }
 
@@ -2916,6 +3244,7 @@ pub(crate) fn parse_review(value: &serde_json::Value) -> Result<ReviewDecision, 
 /// the prompt then carries the weekend trade-off (gap risk against the cost of
 /// flattening), and `origin` names which question produced the verdict so the
 /// journal can tell the two apart.
+#[allow(clippy::too_many_arguments)]
 async fn review_positions(
     state: &AppState,
     settings: &AutopilotSettings,
@@ -2924,10 +3253,11 @@ async fn review_positions(
     positions: &[ManagedPosition],
     weekend: Option<WeekendPrep>,
     origin: &'static str,
+    loss: Option<&Trajectory>,
 ) -> TickOutcome {
     let judgements = judgement_for_symbol(session.judgements, series.symbol().as_str());
-    let instructions = review_instructions(series, positions, weekend, state.jev().is_some());
-    let input = review_input(state, series, positions, judgements, weekend);
+    let instructions = review_instructions(series, positions, weekend, state.jev().is_some(), loss);
+    let input = review_input(state, series, positions, judgements, weekend, loss);
     let outcome = match agent::run(session, &instructions, &input).await {
         Ok(outcome) => {
             state.decision_health().succeeded();
@@ -2961,6 +3291,7 @@ async fn review_positions(
     let context = DecisionContext {
         rationale: outcome.rationale.as_deref(),
         judgements,
+        forecast: None,
         tool_names: Some(&tool_names),
         menu: None,
     };
@@ -3100,9 +3431,11 @@ async fn review_positions(
 /// MT4 refuses (code 130) a stop closer to the current price than the
 /// instrument's stop level, or inside its freeze level. The stop is pulled
 /// back to that distance (plus one tick, so rounding cannot land inside it)
-/// and onto the tick grid, rounding away from the price. `None` means the
-/// fitted stop no longer does its job: it would not improve the current stop,
-/// or a break-even or profit-lock stop would fall below entry.
+/// and onto the tick grid, rounding away from the price. `None` means there is
+/// nothing the venue would accept or nothing worth sending: the price is
+/// inside that distance of the take-profit (which the venue re-checks on every
+/// modify), the fitted stop would not improve the current stop, or a
+/// break-even or profit-lock stop would fall below entry.
 fn fit_to_venue(
     plan: StopMove,
     position: &ManagedPosition,
@@ -3118,6 +3451,18 @@ fn fit_to_venue(
     }
     let distance =
         f64::from(spec.stop_level_points.max(spec.freeze_level_points)) * spec.point + tick;
+    // MT4 checks the whole bracket on every modify, so with the price already
+    // inside that distance of the take-profit any stop change is refused (code
+    // 130), whatever the new stop. Nothing is worth sending until the price
+    // moves back out or the target fills.
+    let target_too_close = position.take_profit > 0.0
+        && match position.side {
+            ManagedSide::Buy => position.take_profit - position.current < distance,
+            ManagedSide::Sell => position.current - position.take_profit < distance,
+        };
+    if target_too_close {
+        return None;
+    }
     // A hair of slack so values already on the grid are not pushed a tick.
     const GRID_SLACK: f64 = 1e-6;
     let stop = match position.side {
@@ -3147,9 +3492,10 @@ fn fit_to_venue(
 }
 
 /// Readies a planned stop move: fitted to the venue's stop level when the
-/// contract can be read, and held back when the same level was sent less than
-/// [`STOP_RESEND_HOLD_SECS`] ago (the venue refused it, or it is still in
-/// flight). `None` means do not send this tick.
+/// contract can be read, and held back for [`STOP_RESEND_HOLD_SECS`] after the
+/// same level was sent, or after any move the position does not show yet (the
+/// venue refused it, or it is still in flight). `None` means do not send this
+/// tick.
 async fn prepare_stop(
     state: &AppState,
     position: &ManagedPosition,
@@ -3179,10 +3525,13 @@ async fn prepare_stop(
         .filter(|tick| tick.is_finite() && *tick > 0.0)
         .unwrap_or_else(|| position.current.abs() * 1e-6);
     let now = unix_secs(state.now());
-    if state
-        .stop_basis()
-        .recently_attempted(plan.ticket, plan.stop, tolerance, now)
-    {
+    if state.stop_basis().recently_attempted(
+        plan.ticket,
+        plan.stop,
+        position.stop_loss,
+        tolerance,
+        now,
+    ) {
         return None;
     }
     state
@@ -3310,6 +3659,7 @@ fn review_instructions(
     positions: &[ManagedPosition],
     weekend: Option<WeekendPrep>,
     judge: bool,
+    loss: Option<&Trajectory>,
 ) -> String {
     let tickets: Vec<String> = positions
         .iter()
@@ -3326,13 +3676,45 @@ fn review_instructions(
     format!(
         "You are the analyst for Veyra, a single-instrument trading bot. Your open {symbol}          {timeframe} position(s) (ticket(s) {tickets}) were entered by this bot with a stop loss          and take profit attached.
          Decide for the reported position: `hold` keeps the entry bracket and lets the plan play          out; `close` flattens the ticket now because the thesis that justified the entry is no          longer supported by the latest candles and judgements.
-         Closing costs the spread and abandons the bracket, so hold unless the evidence has          genuinely shifted; do not close merely because the position shows a small loss — the          attached stop defines the risk.{weekend_rules}
+         {risk_rules}{weekend_rules}
          Answer with the provided schema only, including the ticket when you close, and a short `rationale` (a sentence or two, at most 280 characters) explaining the decision. Before answering you may call read-only tools: get_market(symbol, timeframe?, bars?),{judgement_tool} get_account(), get_positions(), and get_market_window(). Call a tool only when its result would change your decision.",
         symbol = series.symbol().as_str(),
         timeframe = series.timeframe().as_str(),
         tickets = tickets.join(", "),
+        risk_rules = match loss {
+            Some(path) => loss_rules(path),
+            None => "Closing costs the spread and abandons the bracket, so hold unless the evidence          has genuinely shifted; do not close merely because the position shows a small loss —          the attached stop defines the risk.".to_owned(),
+        },
         weekend_rules = weekend_rules,
         judgement_tool = if judge { " get_judgements(symbol)," } else { "" }
+    )
+}
+
+/// The loss-checkpoint framing: where the trade stands, what the stop would
+/// cost, and how to weigh its path. Holding is the default: replaying this
+/// bot's history (2026-10-06) showed 17 of 21 trades that reached -0.5 R still
+/// closed in profit, so cutting on the size of a loss alone would have cost
+/// more than every loss it saved. A close needs the entry's reason to be gone.
+fn loss_rules(path: &Trajectory) -> String {
+    let money = |amount: Option<f64>, pct: Option<f64>| match (amount, pct) {
+        (Some(amount), Some(pct)) => format!("{amount:.2} ({pct:.1}% of equity)"),
+        (Some(amount), None) => format!("{amount:.2}"),
+        _ => "unknown".to_owned(),
+    };
+    format!(
+        "This is a loss checkpoint, asked as soon as the position reached {r:.2} R against its          plan rather than at the next candle. It is {open} in the account currency after          {minutes} minutes; at its stop it would be about {stop}. Its best point since entry was          {best:+.2} R, it is moving {pace} over the last hour, and {against} of the last four          15-minute bars closed against it (the `trajectory` and `intraday` blocks). Most trades          that dip this far recover: in this bot's own history most positions that reached          -0.5 R still closed in profit, so a loss of this size is not by itself a reason to          close, and cutting a trade that would have recovered turns a winner into a certain loss.          Hold by default. Close only when the evidence shows the entry's reason is gone: price          has broken and held beyond the structure the entry relied on, momentum has turned          decisively against it on the candles as well as the intraday bars, or the judgements          have flipped against the position. Do not close on the size of the loss, its speed, or          discomfort alone; the stop at the broker still caps the risk.",
+        r = path.r_now,
+        open = money(Some(path.open_result), path.open_result_pct),
+        minutes = path.minutes_open,
+        stop = money(path.result_at_stop, path.result_at_stop_pct),
+        best = path.best_r,
+        pace = match path.last_hour_r {
+            Some(change) if change < -0.05 => format!("against it ({change:+.2} R)"),
+            Some(change) if change > 0.05 => format!("back in its favour ({change:+.2} R)"),
+            Some(change) => format!("sideways ({change:+.2} R)"),
+            None => "at an unknown pace".to_owned(),
+        },
+        against = path.bars_against,
     )
 }
 
@@ -3361,6 +3743,7 @@ fn review_input(
     positions: &[ManagedPosition],
     judgements: Option<&Value>,
     weekend: Option<WeekendPrep>,
+    loss: Option<&Trajectory>,
 ) -> String {
     let recent: Vec<Value> = series
         .candles()
@@ -3430,6 +3813,34 @@ fn review_input(
             "market_closes_in_secs": prep.closes_in_secs
         });
     }
+    if let Some(path) = loss {
+        input["trajectory"] = json!({
+            "r_now": round4(path.r_now),
+            "best_r": round4(path.best_r),
+            "worst_r": round4(path.worst_r),
+            "minutes_open": path.minutes_open,
+            "last_hour_r": path.last_hour_r.map(round4),
+            "last_four_bars_against": path.bars_against,
+            "open_result": round4(path.open_result),
+            "open_result_pct_equity": path.open_result_pct.map(round4),
+            "result_at_stop": path.result_at_stop.map(round4),
+            "result_at_stop_pct_equity": path.result_at_stop_pct.map(round4)
+        });
+        input["intraday"] = json!({
+            "timeframe": "M15",
+            "since_entry": path
+                .bars
+                .iter()
+                .map(|bar| json!({
+                    "t": bar.time(),
+                    "o": bar.open(),
+                    "h": bar.high(),
+                    "l": bar.low(),
+                    "c": bar.close()
+                }))
+                .collect::<Vec<_>>()
+        });
+    }
     if let Some(snapshot) = &snapshot {
         input["account"] = json!({
             "free_margin": snapshot.free_margin,
@@ -3440,12 +3851,19 @@ fn review_input(
     input.to_string()
 }
 
+/// Rounds a figure for the prompt: four decimals are plenty for R and money.
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
 /// Optional model context journaled alongside a proposal event: the model's
 /// short rationale and the judgements of the instrument it decided on.
 #[derive(Debug, Default, Clone, Copy)]
 struct DecisionContext<'a> {
     rationale: Option<&'a str>,
     judgements: Option<&'a Value>,
+    /// The decided instrument's range forecast, when the model was shown one.
+    forecast: Option<&'a Value>,
     /// Read-only agent tools used before this decision, in call order.
     tool_names: Option<&'a [String]>,
     /// Every instrument the sweep put in front of the model with the judge's
@@ -3571,6 +3989,9 @@ async fn record_symbol_event_context(
     if let Some(menu) = context.menu {
         payload["menu"] = menu.clone();
     }
+    if let Some(forecast) = context.forecast {
+        payload["forecast"] = forecast.clone();
+    }
     if let Some(names) = context.tool_names
         && !names.is_empty()
     {
@@ -3664,6 +4085,9 @@ async fn record_event_context(
     if let Some(judgements) = context.judgements {
         payload["judgements"] = judgements.clone();
     }
+    if let Some(forecast) = context.forecast {
+        payload["forecast"] = forecast.clone();
+    }
     if let Some(names) = context.tool_names
         && !names.is_empty()
     {
@@ -3675,8 +4099,10 @@ async fn record_event_context(
         .await;
 }
 
-/// Asks the judgement engine for calibrated answers over the same market
-/// state, returning a compact JSON summary for the model input.
+/// Asks the judgement engine for its trend readings over the same market
+/// state, returning a compact JSON summary for the model input. The judge sees
+/// only [`market_narrative`]'s one-line summary, so a reading restates the move
+/// so far; [`super::judge_record`] scores readings against real results.
 pub(crate) async fn judgements_for(
     jev: &JevRuntime,
     series: &CandleSeries,
@@ -3784,6 +4210,15 @@ fn market_narrative(series: &CandleSeries) -> String {
 }
 
 /// Assembles the structured model input for one proposal.
+///
+/// With the per-currency exposure cap on (`factor_cap` lots), the input also
+/// carries the book's net lots per asset and, on each instrument, the sides
+/// the cap would refuse at the smallest tradable volume, so the model does not
+/// spend an answer on an entry the gate is certain to reject. With a judge
+/// record, the input carries it as `judge_record`. With a forecaster, every
+/// instrument carries its `forecast` (or `"unavailable"`) and the input the
+/// scored `forecast_record` once there is one.
+#[allow(clippy::too_many_arguments)]
 fn proposal_input(
     markets: &[(Symbol, CandleSeries)],
     judgements: &[(Symbol, Value)],
@@ -3792,6 +4227,9 @@ fn proposal_input(
     specs: &[(Symbol, SymbolSpecPayload)],
     events: &[CalendarEvent],
     now: i64,
+    factor_cap: f64,
+    judge_record: Option<&JudgeRecord>,
+    forecasts: Option<&ForecastInputs<'_>>,
 ) -> String {
     let assets: Vec<Value> = markets
         .iter()
@@ -3868,6 +4306,11 @@ fn proposal_input(
             if let Some(summary) = judgement_for_symbol(judgements, symbol.as_str()) {
                 asset["judgements"] = summary.clone();
             }
+            if let Some(forecasts) = forecasts {
+                asset["forecast"] = judgement_for_symbol(forecasts.per_symbol, symbol.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| json!(FORECAST_UNAVAILABLE));
+            }
             if let Some(position) = managed
                 .iter()
                 .find(|position| position.symbol.eq_ignore_ascii_case(symbol.as_str()))
@@ -3882,11 +4325,35 @@ fn proposal_input(
                     "take_profit": position.take_profit
                 });
             }
+            if factor_cap > 0.0 {
+                // The smallest order the venue takes: if the cap refuses even
+                // that, it refuses every size on this side.
+                let smallest = symbol_spec_for(specs, symbol.as_str())
+                    .map(|spec| spec.lot_min)
+                    .filter(|lots| *lots > 0.0)
+                    .unwrap_or(SMALLEST_PROBE_LOTS);
+                let refused: Vec<&str> = [Side::Buy, Side::Sell]
+                    .into_iter()
+                    .filter(|side| {
+                        valuation::breaches_factor_cap(
+                            &account.open_positions,
+                            symbol,
+                            *side,
+                            smallest,
+                            factor_cap,
+                        )
+                    })
+                    .map(Side::as_str)
+                    .collect();
+                if !refused.is_empty() {
+                    asset["exposure_refuses"] = json!(refused);
+                }
+            }
             asset
         })
         .collect();
 
-    json!({
+    let mut input = json!({
         "timeframe": markets
             .first()
             .map(|(_, series)| series.timeframe().as_str())
@@ -3903,8 +4370,22 @@ fn proposal_input(
                 .map(|symbol| symbol.as_str())
                 .collect::<Vec<_>>()
         }
-    })
-    .to_string()
+    });
+    if factor_cap > 0.0 {
+        let net_lots: serde_json::Map<String, Value> =
+            valuation::book_exposure(&account.open_positions)
+                .into_iter()
+                .map(|(asset, lots)| (asset, json!((lots * 10_000.0).round() / 10_000.0)))
+                .collect();
+        input["exposure"] = json!({ "cap_lots": factor_cap, "net_lots": net_lots });
+    }
+    if let Some(record) = judge_record {
+        input["judge_record"] = record.to_value();
+    }
+    if let Some(record) = forecasts.and_then(|forecasts| forecasts.record.as_ref()) {
+        input["forecast_record"] = record.clone();
+    }
+    input.to_string()
 }
 
 /// Assembles the analyst instructions, including the enforced volume cap.
@@ -3913,6 +4394,8 @@ fn proposal_instructions(
     markets: &[(Symbol, CandleSeries)],
     account: &AccountFacts,
     judge: bool,
+    judge_record: bool,
+    forecasts: Option<&ForecastInputs<'_>>,
 ) -> String {
     let policy = state.risk().policy();
     let menu = markets
@@ -3921,7 +4404,7 @@ fn proposal_instructions(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors. Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release; the `upcoming_events` list shows what is scheduled, so avoid fighting a print. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
+        "You are the analyst for Veyra, a systematic multi-asset trading bot. You are given a menu of          instruments ({menu}) with recent {timeframe} candles{judged_inputs}; the last          candle of each block is the most recent closed bar.{judge_note}{forecast_note}\n         Decide for each instrument independently whether the evidence justifies opening a position right          now. You may open at most one instrument per answer. If none of them is suitable, answer `none`          \u{2014} skipping is normal and expected, and every instrument is reconsidered on the next tick.\n         Use the symbol exactly as written. Constraints: at most {max_orders} open orders and {max_total}          lots total exposure ({open_lots} lots currently open), one position per instrument, and volume at          most {max_volume} lots. If you open, use a market order \u{2014} omit `price` entirely \u{2014} with          both `stop_loss` and `take_profit` as absolute prices bracketing the entry, and stay within the          instrument's own price scale. Omit `comment` entirely (the bot annotates orders itself). A          deterministic risk gate re-validates everything and will reject anything outside these limits;          rejections are expected outcomes, not errors.{exposure_rule} Each asset reports its venue contract \u{2014} spread and stop level in points, lot band and step, margin per lot \u{2014} plus ATR(14); size the volume and stop distance so the order lands on the lot grid, fits the free margin shown in the account block, and keeps the stop outside the spread and the minimum stop level. High-impact events blackout entries for their currencies around the release, and the risk gate enforces that window itself; the `upcoming_events` list shows what is scheduled. A release more than about an hour away is not a reason to skip a setup that otherwise qualifies: the attached stop caps the risk through it. Weigh an event only when it is due within the next hour or so. Always include a short `rationale` (at most 280 characters) explaining why this instrument and direction `-` or, when answering none, why no instrument qualifies; the operator sees it in the decision journal. Before answering you may call read-only tools: {judgement_tool}get_market(symbol, timeframe?, bars?) for another window, get_account(), get_positions(), get_market_window() for session and rollover state, and check_risk(intent) to dry-run a draft through the deterministic gate. Call a tool only when its result would change your decision; otherwise answer none or open.",
         menu = menu,
         timeframe = markets
             .first()
@@ -3932,15 +4415,171 @@ fn proposal_instructions(
         open_lots = account.open_lots,
         max_volume = policy.max_volume_per_order().value(),
         judged_inputs = if judge {
-            " and optional calibrated judgements"
+            " and a trend reading for each instrument (`judgements`)"
         } else {
             ""
         },
         judgement_tool = if judge {
-            "get_judgements(symbol) for calibrated probabilities, "
+            "get_judgements(symbol) for an instrument's trend reading, "
         } else {
             ""
+        },
+        exposure_rule = exposure_rule(policy.max_net_factor_lots()),
+        judge_note = judge_note(judge, judge_record),
+        forecast_note = forecast_note(forecasts),
+    )
+}
+
+/// The instructions' account of what the trend readings are, and of their
+/// record when one is attached; nothing without a judge.
+fn judge_note(judge: bool, record: bool) -> &'static str {
+    match (judge, record) {
+        (false, _) => "",
+        (true, false) => {
+            " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win."
         }
+        (true, true) => {
+            " The trend readings come from a second model that sees only a one-line summary of each window (first and last close, high, low, change, and the last three closes): `direction` says which way the price has already moved, and its probabilities grow with the size of that move. They describe the move so far; they are not odds that a trade will win. `judge_record` shows how the trades opened on each band of readings under the current timeframe have actually done: how many won, and their average result in multiples of the risk taken (`average_r`; below zero loses money). Weigh a reading by that record, not by its size."
+        }
+    }
+}
+
+/// The instructions' account of the range forecasts and of their record;
+/// nothing without a forecaster.
+fn forecast_note(forecasts: Option<&ForecastInputs<'_>>) -> String {
+    let Some(forecasts) = forecasts else {
+        return String::new();
+    };
+    let horizon = RangeRequest::HORIZON_BARS;
+    let mut note = format!(
+        " Each instrument's `forecast` comes from a third model that reads only that instrument's candles and estimates the next {horizon} candles: the highest high (`high`), the lowest low (`low`) and the last close (`close`), each as a `median` with an 80% interval from `p10` to `p90`. They are estimates, not facts. `{FORECAST_UNAVAILABLE}` means no forecast was made this time and says nothing about the instrument."
+    );
+    if forecasts.record.is_some() {
+        note.push_str(" `forecast_record` scores earlier forecasts on this timeframe against what price then did: for sound forecasts about 10% of outcomes land below `p10`, 80% inside and 10% above `p90`, and `close_direction_right` is how often the median close pointed the way price closed (0.5 is a coin flip). Rely on the ranges only as far as that record supports them.");
+    } else {
+        note.push_str(
+            " None has been scored against an outcome yet, so their accuracy is unknown.",
+        );
+    }
+    note
+}
+
+/// What an instrument's `forecast` reads when none was made this tick.
+const FORECAST_UNAVAILABLE: &str = "unavailable";
+/// Most forecasts asked at once; larger menus are asked in batches.
+const FORECAST_BATCH: usize = 8;
+
+/// Forecast inputs for one entry proposal: each market's forecast (or
+/// [`FORECAST_UNAVAILABLE`]) and the scored record for the timeframe.
+struct ForecastInputs<'a> {
+    per_symbol: &'a [(Symbol, Value)],
+    record: Option<Value>,
+}
+
+/// Each market's range forecast for its newest candle, or
+/// [`FORECAST_UNAVAILABLE`]; `None` without a configured forecaster.
+///
+/// Waiting forecasts are scored first, against the candles this tick already
+/// fetched. A forecast held for the same newest candle is reused, so each
+/// instrument costs one call per candle, and the calls for a new candle run
+/// concurrently. A failure is logged and not asked again for
+/// [`crate::forecast::record::RETRY_AFTER_SECS`]; nothing here stops the tick.
+async fn range_forecasts(
+    state: &AppState,
+    markets: &[(Symbol, CandleSeries)],
+) -> Option<Vec<(Symbol, Value)>> {
+    let runtime = state.forecast()?;
+    let book = state.forecasts();
+    let now = unix_secs(state.now());
+    let mut asks = Vec::new();
+    for (symbol, series) in markets {
+        book.resolve(series);
+        let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+        if book
+            .held(symbol.as_str(), series.timeframe(), candle_time)
+            .is_some()
+            || !book.may_ask(symbol.as_str(), now)
+        {
+            continue;
+        }
+        match RangeRequest::from_series(series, RangeRequest::HORIZON_BARS) {
+            Ok(request) => asks.push(request),
+            Err(error) => {
+                tracing::warn!(symbol = symbol.as_str(), %error, "range forecast cannot be asked");
+                book.failed(symbol.as_str(), now);
+            }
+        }
+    }
+    let mut asks = asks.into_iter().peekable();
+    while asks.peek().is_some() {
+        let calls: Vec<_> = asks
+            .by_ref()
+            .take(FORECAST_BATCH)
+            .map(|request| {
+                let runtime = runtime.clone();
+                actix_web::rt::spawn(async move {
+                    let result = runtime.forecast(&request).await;
+                    (request, result)
+                })
+            })
+            .collect();
+        for call in calls {
+            match call.await {
+                Ok((_, Ok(forecast))) => book.hold(forecast),
+                Ok((request, Err(error))) => {
+                    tracing::warn!(
+                        symbol = request.symbol().as_str(),
+                        %error,
+                        "range forecast unavailable; the model sees it as unavailable"
+                    );
+                    book.failed(request.symbol().as_str(), now);
+                }
+                Err(error) => tracing::warn!(%error, "range forecast task failed"),
+            }
+        }
+    }
+    Some(
+        markets
+            .iter()
+            .map(|(symbol, series)| {
+                let candle_time = series.last().map(|candle| candle.time()).unwrap_or(0);
+                let forecast = book
+                    .held(symbol.as_str(), series.timeframe(), candle_time)
+                    .map_or_else(|| json!(FORECAST_UNAVAILABLE), |held| held.to_value());
+                (symbol.clone(), forecast)
+            })
+            .collect(),
+    )
+}
+
+/// Longest wait for the judge record before the entry sweep goes on without it.
+const JUDGE_RECORD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The judge's record for the entry prompt, or `None` (logged) when it cannot
+/// be read in time: the sweep still runs, the model just sees no record.
+async fn load_judge_record(state: &AppState) -> Option<JudgeRecord> {
+    match actix_web::rt::time::timeout(JUDGE_RECORD_TIMEOUT, super::judge_record::load(state)).await
+    {
+        Ok(Ok(record)) => record,
+        Ok(Err(reason)) => {
+            tracing::warn!(%reason, "judge record unavailable; proposing without it");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("judge record timed out; proposing without it");
+            None
+        }
+    }
+}
+
+/// The instructions' account of the per-currency exposure cap, or nothing when
+/// the cap is off.
+fn exposure_rule(cap: f64) -> String {
+    if cap <= 0.0 {
+        return String::new();
+    }
+    format!(
+        " Exposure is counted per currency or asset: a position is long the first half of its symbol and short the second (short AUDCAD is short AUD and long CAD; long XAUUSD is long gold and short USD), and the gate refuses an entry that would push the net lots on any one of them beyond {cap} lots. `exposure.net_lots` is the book's net position in each, and an instrument's `exposure_refuses` lists the sides refused for that reason right now, so do not propose them."
     )
 }
 
@@ -4547,6 +5186,33 @@ mod tests {
             "lists trim, validate, and de-duplicate in order"
         );
 
+        // The rotation cap is a setting: a raised cap admits a longer list, a
+        // lowered one refuses a list it no longer fits.
+        let seventeen = (1..=17)
+            .map(|i| format!("S{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raised = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok(seventeen.clone()),
+            "VEYRA_AUTOPILOT_MAX_SYMBOLS" => Ok("17".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        assert_eq!(raised.symbols().len(), 17);
+        let lowered = AutopilotSettings::from_source(|requested| match requested {
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("EURUSD,GBPUSD,XAUUSD".to_owned()),
+            "VEYRA_AUTOPILOT_MAX_SYMBOLS" => Ok("2".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name: requested }),
+        })
+        .expect_err("a list longer than the cap is refused");
+        assert!(matches!(
+            lowered,
+            ConfigError::InvalidEnvironmentVariable {
+                name: "VEYRA_AUTOPILOT_SYMBOLS",
+                ..
+            }
+        ));
+
         let conflict = AutopilotSettings::from_source(|requested| match requested {
             "VEYRA_AUTOPILOT_SYMBOL" => Ok("EURUSD".to_owned()),
             "VEYRA_AUTOPILOT_SYMBOLS" => Ok("GBPUSD".to_owned()),
@@ -4576,6 +5242,9 @@ mod tests {
                 "VEYRA_AUTOPILOT_SYMBOLS",
                 "A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q",
             ),
+            ("VEYRA_AUTOPILOT_MAX_SYMBOLS", "0"),
+            ("VEYRA_AUTOPILOT_MAX_SYMBOLS", "65"),
+            ("VEYRA_AUTOPILOT_MAX_SYMBOLS", "lots"),
             ("VEYRA_AUTOPILOT_TIMEFRAME", "H6"),
             ("VEYRA_AUTOPILOT_BARS", "9"),
             ("VEYRA_AUTOPILOT_BARS", "241"),
@@ -5386,8 +6055,26 @@ mod tests {
             requests[0].instructions.contains("get_judgements(symbol)")
                 && requests[0]
                     .instructions
-                    .contains("optional calibrated judgements"),
-            "with a judge the instructions offer judgements"
+                    .contains("a trend reading for each instrument")
+                && requests[0]
+                    .instructions
+                    .contains("they are not odds that a trade will win"),
+            "with a judge the instructions offer the readings for what they are"
+        );
+        assert!(
+            !requests[0].instructions.contains("calibrated"),
+            "nothing calls the readings calibrated"
+        );
+        assert!(
+            input.get("judge_record").is_none()
+                && !requests[0].instructions.contains("judge_record"),
+            "without a ledger there is no record to show"
+        );
+        assert!(
+            input["assets"][0].get("forecast").is_none()
+                && input.get("forecast_record").is_none()
+                && !requests[0].instructions.contains("forecast"),
+            "without a forecaster nothing mentions forecasts"
         );
         assert_eq!(input["assets"][0]["market"]["bars"], 20);
         assert_eq!(
@@ -5400,6 +6087,151 @@ mod tests {
         );
         assert_eq!(input["assets"][0]["contract"]["lot_min"], 0.01);
         assert_eq!(input["assets"][0]["contract"]["stop_level_points"], 5);
+    }
+
+    /// A harness over 30 candles with `forecaster` attached.
+    fn forecast_harness(
+        engine: Arc<StubEngine>,
+        forecaster: Arc<crate::forecast::tests::StubForecaster>,
+    ) -> Rig {
+        let mut harness = build_harness(
+            enabled_settings(),
+            Some(engine),
+            Some(StubFeed {
+                bars: 30,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        harness.state = harness.state.clone().with_forecast(Some(
+            crate::forecast::ForecastRuntime::from_forecaster(forecaster),
+        ));
+        harness
+    }
+
+    #[actix_web::test]
+    async fn tick_feeds_range_forecasts_and_their_record_into_the_model_input() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let forecaster =
+            crate::forecast::tests::StubForecaster::answering(crate::forecast::tests::estimates());
+        let harness = forecast_harness(engine.clone(), forecaster.clone());
+
+        // A forecast made ten candles ago, whose horizon has since closed.
+        let feed = harness.state.market().expect("market").feed();
+        let series = feed
+            .candles(
+                CandleRequest::new(
+                    Symbol::parse("EURUSD").expect("symbol"),
+                    enabled_settings().timeframe(),
+                    30,
+                )
+                .expect("request"),
+            )
+            .await
+            .expect("candles");
+        let earlier = CandleSeries::from_validated(
+            series.symbol().clone(),
+            series.timeframe(),
+            series.candles()[..20].to_vec(),
+        );
+        harness
+            .state
+            .forecasts()
+            .hold(crate::forecast::Forecast::new(
+                &RangeRequest::from_series(&earlier, RangeRequest::HORIZON_BARS).expect("request"),
+                &crate::forecast::tests::estimates(),
+            ));
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        let asked = forecaster.requests();
+        assert_eq!(asked.len(), 1, "one call, for the newest candle");
+        assert_eq!(asked[0].candle_time(), series.last().expect("last").time());
+
+        let requests = engine.requests();
+        let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
+        assert_eq!(
+            input["assets"][0]["forecast"],
+            json!({
+                "horizon_bars": 6,
+                "high": {"p10": 1.15, "median": 1.152, "p90": 1.155},
+                "low": {"p10": 1.14, "median": 1.143, "p90": 1.145},
+                "close": {"p10": 1.142, "median": 1.148, "p90": 1.153}
+            })
+        );
+        assert_eq!(
+            input["forecast_record"]["scored"], 1,
+            "the earlier forecast was scored against the candles after it"
+        );
+        let instructions = &requests[0].instructions;
+        assert!(
+            instructions.contains("third model")
+                && instructions.contains("estimates, not facts")
+                && instructions.contains("`forecast_record` scores earlier forecasts"),
+            "the instructions say what the forecasts and their record are: {instructions}"
+        );
+
+        let _ = tick(&harness.state).await;
+        assert_eq!(
+            forecaster.requests().len(),
+            1,
+            "the same candle is never forecast twice"
+        );
+        let usage = harness.state.forecast().expect("forecaster").usage();
+        assert_eq!(
+            (usage.calls, usage.failures, usage.input_tokens),
+            (1, 0, 900)
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_failed_forecast_reads_unavailable_and_never_blocks_the_tick() {
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let forecaster = crate::forecast::tests::StubForecaster::failing("provider down");
+        let harness = forecast_harness(engine.clone(), forecaster.clone());
+
+        assert_eq!(tick(&harness.state).await, TickOutcome::NoTrade);
+        let requests = engine.requests();
+        let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
+        assert_eq!(input["assets"][0]["forecast"], "unavailable");
+        assert!(input.get("forecast_record").is_none());
+        assert!(
+            requests[0].instructions.contains("accuracy is unknown")
+                && requests[0]
+                    .instructions
+                    .contains("`unavailable` means no forecast"),
+            "{}",
+            requests[0].instructions
+        );
+
+        let _ = tick(&harness.state).await;
+        assert_eq!(
+            forecaster.requests().len(),
+            1,
+            "a failed symbol waits before it is asked again"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_forecast_behind_an_entry_travels_with_the_decision() {
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let forecaster =
+            crate::forecast::tests::StubForecaster::answering(crate::forecast::tests::estimates());
+        let harness = forecast_harness(engine, forecaster);
+        assert!(matches!(
+            tick(&harness.state).await,
+            TickOutcome::Queued { .. }
+        ));
+        let decision = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.kind() == AuditKind::ProposalEvaluated)
+            .expect("decision recorded");
+        assert_eq!(decision.payload()["forecast"]["high"]["median"], 1.152);
     }
 
     #[actix_web::test]
@@ -7269,29 +8101,84 @@ mod tests {
     #[test]
     fn the_same_stop_is_not_resent_within_the_hold() {
         let basis = StopBasis::default();
+        let old_stop = 1.41180;
         basis.record_attempt(7, 1.41759, 1_000);
-        assert!(basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + 60));
+        assert!(basis.recently_attempted(7, 1.41759, old_stop, 0.00001, 1_000 + 60));
         assert!(
-            basis.recently_attempted(7, 1.417595, 0.00001, 1_000 + 60),
+            basis.recently_attempted(7, 1.417595, old_stop, 0.00001, 1_000 + 60),
             "within a tick"
         );
         assert!(
-            !basis.recently_attempted(7, 1.41790, 0.00001, 1_000 + 60),
-            "a new level goes out"
+            !basis.recently_attempted(7, 1.41790, 1.41759, 0.00001, 1_000 + 60),
+            "once the sent level is applied, a new level goes out"
         );
         assert!(
-            !basis.recently_attempted(8, 1.41759, 0.00001, 1_000 + 60),
+            !basis.recently_attempted(8, 1.41759, old_stop, 0.00001, 1_000 + 60),
             "per ticket"
         );
         assert!(
-            !basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + STOP_RESEND_HOLD_SECS),
+            !basis.recently_attempted(7, 1.41759, old_stop, 0.00001, 1_000 + STOP_RESEND_HOLD_SECS),
             "the hold expires"
         );
         basis.observe(&[]);
         assert!(
-            !basis.recently_attempted(7, 1.41759, 0.00001, 1_000 + 60),
+            !basis.recently_attempted(7, 1.41759, old_stop, 0.00001, 1_000 + 60),
             "closed tickets are forgotten"
         );
+    }
+
+    #[test]
+    fn a_refused_move_holds_every_level_until_the_hold_expires() {
+        // The NZDUSD loop: a trailing plan shifted a few points every tick and
+        // each new level was refused in turn, twice a minute.
+        let basis = StopBasis::default();
+        let old_stop = 0.56619;
+        basis.record_attempt(9, 0.56632, 1_000);
+        for (offset, level) in [(30, 0.56635), (60, 0.56641), (270, 0.56650)] {
+            assert!(
+                basis.recently_attempted(9, level, old_stop, 0.00001, 1_000 + offset),
+                "{level} waits while 0.56632 is not on the position"
+            );
+        }
+        assert!(!basis.recently_attempted(
+            9,
+            0.56650,
+            old_stop,
+            0.00001,
+            1_000 + STOP_RESEND_HOLD_SECS
+        ));
+    }
+
+    #[test]
+    fn no_stop_is_sent_while_the_target_is_inside_the_stop_level() {
+        // NZDUSD on 2026-10-16: bid 0.56698, take-profit 0.5674 (42 points
+        // away) under a 60-point stop level. MT4 refused every stop change.
+        let spec = usdcad_spec();
+        let mut long = managed_position(ManagedSide::Buy, 0.56543, 0.56619, 0.56698);
+        long.take_profit = 0.56740;
+        let plan = StopMove {
+            ticket: 1,
+            stop: 0.56630,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        assert!(fit_to_venue(plan, &long, &spec).is_none());
+        // With the target 70 points out, the move goes.
+        long.take_profit = 0.56768;
+        assert!(fit_to_venue(plan, &long, &spec).is_some());
+        // No target at all never blocks.
+        long.take_profit = 0.0;
+        assert!(fit_to_venue(plan, &long, &spec).is_some());
+
+        let mut short = managed_position(ManagedSide::Sell, 1.42000, 1.42300, 1.41700);
+        short.take_profit = 1.41650;
+        let lower = StopMove {
+            ticket: 1,
+            stop: 1.41900,
+            kind: StopMoveKind::ProfitHarvest,
+        };
+        assert!(fit_to_venue(lower, &short, &spec).is_none());
+        short.take_profit = 1.41620;
+        assert!(fit_to_venue(lower, &short, &spec).is_some());
     }
 
     fn managed_position_named(symbol: &str) -> ManagedPosition {
@@ -7756,18 +8643,17 @@ mod tests {
             true,
             true,
         );
+        // One R in profit, with the target still ahead of the price: the
+        // fixture's usual 1.14554 target would already have filled at 1.14544.
+        let mut book = managed_snapshot_at(10650805, 1_758_000_000, 1_758_003_600, 1.14544);
+        book.positions[0].take_profit = 1.14300;
         harness
             .state
             .broker()
             .expect("broker")
             .ea_link()
             .expect("link")
-            .retain_snapshot(managed_snapshot_at(
-                10650805,
-                1_758_000_000,
-                1_758_003_600,
-                1.14544,
-            ));
+            .retain_snapshot(book);
 
         match tick(&harness.state).await {
             TickOutcome::StopMoved { command } => assert!(!command.is_empty()),
@@ -7817,18 +8703,16 @@ mod tests {
             true,
         );
         let risk = 1.1497 - 1.14757;
+        let mut book =
+            managed_snapshot_at(10650805, 1_758_000_000, 1_758_003_600, 1.14757 - 2.0 * risk);
+        book.positions[0].take_profit = 1.14000;
         harness
             .state
             .broker()
             .expect("broker")
             .ea_link()
             .expect("link")
-            .retain_snapshot(managed_snapshot_at(
-                10650805,
-                1_758_000_000,
-                1_758_003_600,
-                1.14757 - 2.0 * risk,
-            ));
+            .retain_snapshot(book);
         assert!(matches!(
             tick(&harness.state).await,
             TickOutcome::StopMoved { .. }
@@ -7842,6 +8726,302 @@ mod tests {
             .ea_link()
             .expect("link");
         assert!(link.has_pending(CommandKind::ModifyOrder));
+    }
+
+    #[actix_web::test]
+    async fn the_model_is_shown_how_trades_on_each_reading_have_done() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let judge = StubJudge::responding(judgements_response());
+        let mut harness = build_harness(
+            settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            Some(judge),
+            true,
+            true,
+        );
+        // One earlier EURUSD long, opened on a 0.93 long reading and stopped
+        // out at -1 R.
+        let ledger = Arc::new(crate::ledger::MemoryLedger::default());
+        let now = unix_secs(test_now());
+        crate::ledger::TradeLedger::record_trades(
+            ledger.as_ref(),
+            &[crate::broker::ClosedTradePayload {
+                ticket: 41,
+                symbol: "EURUSD".to_owned(),
+                kind: crate::broker::PositionKind::Buy,
+                lots: 0.01,
+                open_price: 1.1000,
+                close_price: 1.0950,
+                open_time: now - 7_200,
+                close_time: now - 3_600,
+                profit: -2.0,
+                swap: 0.0,
+                commission: 0.0,
+                magic: ORDER_MAGIC,
+            }],
+        )
+        .await
+        .expect("recorded");
+        harness.state = harness.state.clone().with_ledger(Some(ledger));
+        let command = "0d33013f-93a0-4537-b8b9-87f655bd405b";
+        let trail = harness.state.audit().expect("audit").trail().clone();
+        trail
+            .record(AuditEvent::new(
+                AuditKind::ProposalEvaluated,
+                json!({
+                    "outcome": "queued",
+                    "origin": "autopilot",
+                    "symbol": "EURUSD",
+                    "side": "buy",
+                    "stop_loss": 1.0950,
+                    "command_id": command,
+                    "judgements": {"direction": {"probabilities": {"long": 0.93, "short": 0.05, "flat": 0.02}}}
+                }),
+            ))
+            .await
+            .expect("recorded");
+        trail
+            .record(AuditEvent::new(
+                AuditKind::CommandCompleted,
+                json!({"kind": "open_order", "command_id": command, "result": {"ticket": 41, "retcode": 0, "executed": true}}),
+            ))
+            .await
+            .expect("recorded");
+
+        assert_eq!(decision_tick(&harness.state).await, TickOutcome::NoTrade);
+        let request = &engine.requests()[0];
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        assert_eq!(input["judge_record"]["scored_trades"], 1);
+        assert_eq!(
+            input["judge_record"]["bands"],
+            json!([{"reading": "0.9 and above", "trades": 1, "won": 0, "average_r": -1.0}])
+        );
+        assert!(
+            request
+                .instructions
+                .contains("Weigh a reading by that record, not by its size."),
+            "the instructions say what the record is for"
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_model_is_shown_the_exposure_the_cap_counts() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("EURUSD,GBPUSD".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let engine = StubEngine::answering(json!({"action": "none"}));
+        let harness = build_harness(
+            settings,
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let allowed = vec![
+            Symbol::parse("EURUSD").expect("symbol"),
+            Symbol::parse("GBPUSD").expect("symbol"),
+        ];
+        let policy = |cap: f64| {
+            RiskPolicy::new(
+                false,
+                allowed.clone(),
+                Volume::parse(0.05).expect("volume"),
+                Volume::parse(0.05).expect("volume"),
+                2,
+                Duration::from_secs(60),
+                None,
+            )
+            .with_limits(0.0, 0.0, 0.0, cap)
+        };
+        harness.state.risk().update_policy(policy(0.01));
+        // A manual EURUSD short: short EUR and long USD, outside Veyra's own
+        // book but inside the gate's.
+        let now = unix_secs(test_now());
+        let mut book = managed_snapshot_at(10650805, now - 3_600, now, 1.1490);
+        book.positions[0].magic = 0;
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(book);
+
+        assert_eq!(decision_tick(&harness.state).await, TickOutcome::NoTrade);
+        let requests = engine.requests();
+        let input: Value = serde_json::from_str(&requests[0].input).expect("input is JSON");
+        assert_eq!(
+            input["exposure"],
+            json!({"cap_lots": 0.01, "net_lots": {"EUR": -0.01, "USD": 0.01}})
+        );
+        let refused = |symbol: &str| {
+            input["assets"]
+                .as_array()
+                .expect("assets")
+                .iter()
+                .find(|asset| asset["symbol"] == symbol)
+                .map(|asset| asset["exposure_refuses"].clone())
+                .expect("offered")
+        };
+        // Selling either pair adds a second lot of long USD (and selling
+        // EURUSD a second lot of short EUR); buying unwinds or stays inside.
+        assert_eq!(refused("EURUSD"), json!(["sell"]));
+        assert_eq!(refused("GBPUSD"), json!(["sell"]));
+        assert!(
+            requests[0]
+                .instructions
+                .contains("beyond 0.01 lots. `exposure.net_lots`"),
+            "the instructions state the rule and the cap"
+        );
+
+        // With the cap off, neither the block nor the rule is sent.
+        harness.state.risk().update_policy(policy(0.0));
+        assert_eq!(exposure_rule(0.0), "");
+        let input: Value = serde_json::from_str(&proposal_input(
+            &[],
+            &[],
+            &crate::routes::account_facts(&harness.state)
+                .await
+                .expect("facts"),
+            &[],
+            &[],
+            &[],
+            now,
+            0.0,
+            None,
+            None,
+        ))
+        .expect("input is JSON");
+        assert!(input.get("exposure").is_none());
+    }
+
+    #[actix_web::test]
+    async fn a_stop_out_the_position_loop_has_not_seen_still_cools_the_symbol() {
+        let settings = settings_from(|name| match name {
+            "VEYRA_AUTOPILOT_ENABLED" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_PROFIT_HARVEST" => Ok("true".to_owned()),
+            "VEYRA_AUTOPILOT_SYMBOLS" => Ok("EURUSD,GBPUSD".to_owned()),
+            _ => Err(ConfigError::MissingEnvironmentVariable { name }),
+        });
+        let now = unix_secs(test_now());
+        let rig = |engine: Arc<StubEngine>| {
+            let harness = build_harness(
+                settings.clone(),
+                Some(engine),
+                Some(StubFeed {
+                    bars: 20,
+                    fail: false,
+                    spec: None,
+                    spec_fail: false,
+                }),
+                None,
+                true,
+                true,
+            );
+            harness.state.risk().update_policy(RiskPolicy::new(
+                false,
+                vec![
+                    Symbol::parse("EURUSD").expect("symbol"),
+                    Symbol::parse("GBPUSD").expect("symbol"),
+                ],
+                Volume::parse(0.05).expect("volume"),
+                Volume::parse(0.05).expect("volume"),
+                1,
+                Duration::from_secs(60),
+                None,
+            ));
+            harness
+        };
+        let empty_book = || {
+            let mut book = managed_snapshot_at(10650805, now - 3_600, now, 1.1497);
+            book.positions.clear();
+            book.orders = 0;
+            book.lots = 0.0;
+            book
+        };
+        let offered = |engine: &StubEngine| -> Vec<String> {
+            engine
+                .requests()
+                .first()
+                .map(|request| {
+                    let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+                    input["assets"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|asset| asset["symbol"].as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        // Control: with nothing closed, EURUSD is offered and traded.
+        let control_engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let control = rig(control_engine.clone());
+        control
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(empty_book());
+        let outcome = decision_tick(&control.state).await;
+        assert!(matches!(outcome, TickOutcome::Queued { .. }), "{outcome:?}");
+        assert_eq!(offered(&control_engine), ["EURUSD", "GBPUSD"]);
+
+        // The position loop saw the EURUSD short while it was open...
+        let engine = StubEngine::answering(open_proposal(true, "EURUSD"));
+        let harness = rig(engine.clone());
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        link.retain_snapshot(managed_snapshot_at(10650805, now - 3_600, now, 1.1490));
+        harness.state.profit_harvest_book().observe(
+            &managed_positions(&harness.state),
+            now,
+            Duration::from_secs(900),
+        );
+        // ...then it was stopped out, and the decision sweep runs before the
+        // position loop looks at the book again.
+        link.retain_snapshot(empty_book());
+
+        let outcome = decision_tick(&harness.state).await;
+        assert!(
+            !matches!(outcome, TickOutcome::Queued { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            offered(&engine),
+            ["GBPUSD"],
+            "the symbol just stopped out is not offered again"
+        );
+        assert!(
+            harness
+                .state
+                .profit_harvest_book()
+                .cooling("EURUSD", now + 899)
+        );
     }
 
     #[actix_web::test]
@@ -8132,5 +9312,272 @@ mod tests {
             other => panic!("expected unavailable, got {other:?}"),
         }
         assert_eq!(outcomes(&harness.trail), vec!["unavailable".to_owned()]);
+    }
+
+    #[test]
+    fn loss_levels_are_asked_once_each_and_deepest_first() {
+        let watch = LossWatch::default();
+        assert_eq!(
+            watch.due_level(1, -0.2),
+            None,
+            "a small loss is the candle review's"
+        );
+        assert_eq!(watch.due_level(1, -0.5), Some(0));
+        assert_eq!(
+            watch.due_level(1, -0.9),
+            Some(1),
+            "a gap past both levels asks the deeper one"
+        );
+        watch.record(1, 0);
+        assert_eq!(watch.due_level(1, -0.6), None, "each level is asked once");
+        assert_eq!(watch.due_level(1, -0.8), Some(1));
+        watch.record(1, 1);
+        assert_eq!(watch.due_level(1, -2.0), None);
+        assert_eq!(watch.due_level(1, f64::NAN), None);
+        watch.retain(&[]);
+        assert_eq!(
+            watch.due_level(1, -0.6),
+            Some(0),
+            "a closed ticket is forgotten"
+        );
+        // A deeper review covers the shallower level.
+        watch.record(2, 1);
+        assert_eq!(watch.due_level(2, -0.6), None);
+        watch.record(2, 0);
+        assert_eq!(
+            watch.due_level(2, -0.8),
+            None,
+            "recording lower never lowers"
+        );
+    }
+
+    fn open_position(side: ManagedSide, entry: f64, current: f64, profit: f64) -> ManagedPosition {
+        ManagedPosition {
+            ticket: 7,
+            symbol: "EURUSD".to_owned(),
+            side,
+            lots: 0.01,
+            entry,
+            profit,
+            stop_loss: 0.0,
+            take_profit: 0.0,
+            opened_at: 1_000_000,
+            current,
+            swap: 0.0,
+            commission: 0.0,
+            is_market: true,
+        }
+    }
+
+    #[test]
+    fn the_trajectory_reads_the_path_since_entry() {
+        // A short from 1.12100 with 43 pips of risk, now 26 pips against:
+        // today's EURUSD loss an hour in.
+        let short = open_position(ManagedSide::Sell, 1.12100, 1.12360, -2.60);
+        let risk = 0.00430;
+        let bar =
+            |t: i64, o: f64, h: f64, l: f64, c: f64| Candle::from_validated(t, o, h, l, c, 10);
+        let bars = vec![
+            bar(1_000_000 - 3_600, 1.1200, 1.1210, 1.1190, 1.1205),
+            bar(1_000_000 - 300, 1.1209, 1.1211, 1.1200, 1.1210),
+            bar(1_000_600, 1.1210, 1.1220, 1.1205, 1.1218),
+            bar(1_001_500, 1.1218, 1.1225, 1.1215, 1.1224),
+            bar(1_002_400, 1.1224, 1.1230, 1.1222, 1.1228),
+            bar(1_003_300, 1.1228, 1.1238, 1.1226, 1.1236),
+        ];
+        let path = trajectory(&short, risk, Some(40.0), 1_003_600, &bars).expect("path");
+        assert!((path.r_now + 0.0026 / 0.0043).abs() < 1e-9);
+        // The bar before entry is ignored; the one holding it counts.
+        assert!(
+            (path.best_r - 0.0010 / 0.0043).abs() < 1e-9,
+            "{}",
+            path.best_r
+        );
+        assert!(
+            (path.worst_r + 0.0028 / 0.0043).abs() < 1e-9,
+            "{}",
+            path.worst_r
+        );
+        assert_eq!(path.minutes_open, 60);
+        let hour = path.last_hour_r.expect("an hour of bars");
+        assert!((hour + 0.0026 / 0.0043).abs() < 1e-9, "{hour}");
+        assert_eq!(path.bars_against, 4, "every bar since entry closed up");
+        assert!((path.open_result_pct.expect("percent") + 6.5).abs() < 1e-9);
+        assert!((path.result_at_stop.expect("at stop") + 4.30).abs() < 1e-6);
+        assert!((path.result_at_stop_pct.expect("at stop %") + 10.75).abs() < 1e-6);
+        assert_eq!(path.bars.len(), 5);
+
+        // A long reads the other way, and without bars the path is just now.
+        let long = open_position(ManagedSide::Buy, 1.12100, 1.11885, -2.15);
+        let path = trajectory(&long, risk, None, 1_000_600, &[]).expect("path");
+        assert!((path.r_now + 0.5).abs() < 1e-9);
+        assert_eq!((path.best_r, path.worst_r), (path.r_now, path.r_now));
+        assert_eq!(path.last_hour_r, None);
+        assert_eq!(path.bars_against, 0);
+        assert_eq!(path.open_result_pct, None, "no equity, no percentage");
+        assert!((path.result_at_stop.expect("at stop") + 4.30).abs() < 1e-6);
+        // Barely negative is too close to zero to extrapolate a stop result.
+        let flat = open_position(ManagedSide::Buy, 1.12100, 1.12099, -0.01);
+        assert_eq!(
+            trajectory(&flat, risk, Some(40.0), 1_000_600, &[])
+                .expect("path")
+                .result_at_stop,
+            None
+        );
+        // No usable risk or price, no trajectory.
+        assert!(trajectory(&long, 0.0, None, 0, &[]).is_none());
+        assert!(
+            trajectory(
+                &open_position(ManagedSide::Buy, 1.1, 0.0, 0.0),
+                risk,
+                None,
+                0,
+                &[]
+            )
+            .is_none()
+        );
+    }
+
+    #[actix_web::test]
+    async fn a_position_running_against_its_entry_gets_a_loss_review() {
+        let engine = StubEngine::answering(json!({
+            "action": "close",
+            "ticket": 10650805,
+            "rationale": "Never progressed and still climbing; the stop is likely."
+        }));
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        // A short from 1.14757 with its stop at 1.1497 (21.3 pips of risk);
+        // at 1.14885 it is 0.6 R against.
+        harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link")
+            .retain_snapshot(managed_snapshot_at(
+                10650805,
+                1_758_000_000,
+                1_758_003_600,
+                1.14885,
+            ));
+
+        let outcome = tick(&harness.state).await;
+        assert!(
+            matches!(outcome, TickOutcome::CloseQueued { .. }),
+            "{outcome:?}"
+        );
+        let request = &engine.requests()[0];
+        assert!(
+            request.instructions.contains("loss checkpoint"),
+            "{}",
+            request.instructions
+        );
+        assert!(
+            !request
+                .instructions
+                .contains("the attached stop defines the risk"),
+            "the candle review's hold-on-small-losses rule is replaced"
+        );
+        let input: Value = serde_json::from_str(&request.input).expect("input is JSON");
+        let r_now = input["trajectory"]["r_now"].as_f64().expect("r");
+        assert!((r_now + 0.6).abs() < 0.01, "{r_now}");
+        assert_eq!(input["trajectory"]["minutes_open"], 60);
+        assert_eq!(input["intraday"]["timeframe"], "M15");
+        let close = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "close_queued")
+            .expect("close recorded");
+        assert_eq!(close.payload()["origin"], "autopilot_loss_review");
+    }
+
+    #[actix_web::test]
+    async fn a_held_loss_is_asked_again_only_at_the_next_level() {
+        let engine = StubEngine::answering_review(
+            json!({"action": "hold", "rationale": "Pullback into the breakdown level."}),
+            json!({"action": "none"}),
+        );
+        let harness = build_harness(
+            enabled_settings(),
+            Some(engine.clone()),
+            Some(StubFeed {
+                bars: 20,
+                fail: false,
+                spec: None,
+                spec_fail: false,
+            }),
+            None,
+            true,
+            true,
+        );
+        let link = harness
+            .state
+            .broker()
+            .expect("broker")
+            .ea_link()
+            .expect("link");
+        let loss_reviews = |engine: &StubEngine| {
+            engine
+                .requests()
+                .iter()
+                .filter(|request| request.instructions.contains("loss checkpoint"))
+                .count()
+        };
+        link.retain_snapshot(managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_600,
+            1.14885,
+        ));
+        assert_eq!(tick(&harness.state).await, TickOutcome::Held);
+        assert_eq!(loss_reviews(&engine), 1);
+        let held = harness
+            .trail
+            .events()
+            .into_iter()
+            .find(|event| event.payload()["outcome"] == "held")
+            .expect("hold recorded");
+        assert_eq!(held.payload()["origin"], "autopilot_loss_review");
+
+        // Same level, next tick: not asked again, and the candle it was asked
+        // on is not reviewed again either.
+        let reviews_before = engine
+            .requests()
+            .iter()
+            .filter(|request| request.instructions.contains("ticket(s) 10650805"))
+            .count();
+        tick(&harness.state).await;
+        assert_eq!(loss_reviews(&engine), 1);
+        assert_eq!(
+            engine
+                .requests()
+                .iter()
+                .filter(|request| request.instructions.contains("ticket(s) 10650805"))
+                .count(),
+            reviews_before
+        );
+
+        // Deeper, past 0.75 R: asked once more.
+        link.retain_snapshot(managed_snapshot_at(
+            10650805,
+            1_758_000_000,
+            1_758_003_900,
+            1.14935,
+        ));
+        tick(&harness.state).await;
+        assert_eq!(loss_reviews(&engine), 2);
     }
 }

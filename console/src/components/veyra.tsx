@@ -17,6 +17,7 @@ import type {
   AuditPage,
   CommandRecord,
   FeedEvent,
+  ForecastUsage,
   LogLevel,
   LogRecord,
   MarketSessions,
@@ -83,6 +84,7 @@ function Field({
   value,
   tone,
   wide = false,
+  hint,
 }: {
   label: string
   value: ReactNode
@@ -90,10 +92,15 @@ function Field({
   tone?: string
   /** Span every column (long values such as a model chain). */
   wide?: boolean
+  /** What the value means, shown on hover beside the label. */
+  hint?: string
 }) {
   return (
     <div className={`tab-field${wide ? ' is-wide' : ''}`}>
-      <dt>{label}</dt>
+      <dt>
+        {label}
+        {hint ? <Hint text={hint} label={label} /> : null}
+      </dt>
       <dd className={tone}>{value === undefined ? <Skeleton width={72} /> : value}</dd>
     </div>
   )
@@ -432,15 +439,26 @@ function cap(limit: number): string {
   return limit ? amount(limit, 0) : '∞'
 }
 
+/** One line for the forecast record: how many were scored, how often outcomes landed in range, and how often the close pointed right. */
+function forecastRecord(record: ForecastUsage['record']): string {
+  if (!record) return 'Not scored yet'
+  const inside = ((record.high.inside + record.low.inside + record.close.inside) / 3) * 100
+  const direction =
+    record.close_direction_right === undefined ? '' : ` · ${percent(record.close_direction_right * 100)} direction`
+  return `${amount(record.scored, 0)} scored · ${percent(inside)} in range${direction}`
+}
+
 export function AutopilotPanel({
   status,
   budget,
   jevUsage,
+  forecastUsage,
   decisions,
 }: {
   status?: Status['autopilot']
   budget?: Status['model_budget']
   jevUsage?: Status['jev_usage']
+  forecastUsage?: Status['forecast_usage']
   decisions?: Status['decisions']
 }) {
   const on = status?.enabled === true
@@ -536,6 +554,35 @@ export function AutopilotPanel({
                 : '—'
           }
         />
+        <Field
+          label="Forecast calls"
+          hint="Price-range forecasts for each instrument's next 6 candles, one per instrument per candle."
+          value={
+            forecastUsage === undefined
+              ? undefined
+              : forecastUsage
+                ? forecastUsage.calls > 0
+                  ? `${amount(forecastUsage.calls, 0)}${forecastUsage.failures > 0 ? ` · ${forecastUsage.failures} failed` : ''}`
+                  : '—'
+                : 'Off'
+          }
+          tone={forecastUsage && forecastUsage.failures > 0 ? 'tone-warn' : forecastUsage === null ? 'tone-faint' : undefined}
+        />
+        {forecastUsage ? (
+          <>
+            <Field
+              label="Forecast tokens"
+              value={forecastUsage.calls > 0 ? compactTokens(forecastUsage.inputTokens) : '—'}
+            />
+            <Field
+              label="Forecast record"
+              wide
+              hint="Forecasts scored once their 6 candles close. In range: how often the high, low and close landed inside the forecast's 80% band; 80% is sound. Direction: how often the forecast close pointed the way price went; 50% is a coin flip."
+              value={forecastRecord(forecastUsage.record)}
+              tone={forecastUsage.record ? undefined : 'tone-faint'}
+            />
+          </>
+        ) : null}
         {failing ? (
           <Field
             label="Last failure"
@@ -763,9 +810,9 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
   },
   {
     key: 'maxNetFactorLots',
-    label: 'Net USD cap (lots)',
+    label: 'Currency cap (lots)',
     integer: false,
-    help: 'Cap on net exposure to the US dollar across positions, in lots; 0 turns it off.',
+    help: 'Most lots the book may be net long or short any one currency or asset, counting both sides of every pair; 0 turns it off.',
   },
   {
     key: 'calendarBlackoutMinutes',
@@ -1118,7 +1165,7 @@ export function RiskPanel({
           )}
         />
         <Field
-          label="Net USD cap"
+          label="Currency cap"
           value={view((current) => offOr(current.maxNetFactorLots > 0, `${current.maxNetFactorLots} lots`))}
         />
         <Field

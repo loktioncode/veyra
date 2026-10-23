@@ -35,6 +35,6 @@ for i in 1 2 3 4 5; do cargo test --test model_live -- --ignored --nocapture; do
   has no cached judgement, and one to eight model calls per decision (the
   agent loop's `MAX_STEPS`). Ticks log a few seconds after their interval
   fires, consistent with the sums above.
-- The default cadence is 300 s (`VEYRA_AUTOPILOT_INTERVAL_SECS`). The call
+- The default cadence is 300s (`VEYRA_AUTOPILOT_INTERVAL_SECS`). The call
   budget (`VEYRA_MODEL_MAX_CALLS_PER_HOUR` / `_PER_DAY`) is the real bound on
   model spend; size it for up to eight calls per decision.

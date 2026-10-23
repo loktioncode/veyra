@@ -5,6 +5,8 @@
  * same-origin while the service keeps listening on loopback only.
  */
 
+import { resolveToast, showToast } from './toast'
+
 export type AutopilotStatus = {
   enabled: boolean
   interval_secs: number
@@ -35,6 +37,24 @@ export type AutopilotStatus = {
   } | null
 }
 
+/** Shares of scored forecasts whose outcome fell below, inside, or above the 80% interval. */
+export type ForecastBands = { below_p10: number; inside: number; above_p90: number }
+
+export type ForecastUsage = {
+  calls: number
+  failures: number
+  inputTokens: number
+  /** Null until a forecast's horizon has closed and been scored. */
+  record: {
+    scored: number
+    high: ForecastBands
+    low: ForecastBands
+    close: ForecastBands
+    /** Share of scored forecasts whose median close pointed the way price closed. */
+    close_direction_right?: number
+  } | null
+}
+
 export type Status = {
   service: string
   version: string
@@ -55,6 +75,10 @@ export type Status = {
    * `fallbacks` counts judgements Jev answered because OpenAI failed.
    */
   jev_usage: { calls: number; failures: number; inputTokens: number; outputTokens: number; fallbacks?: number } | null
+  /** Range forecaster in use (`workers-ai`); null or absent without one. */
+  forecast_provider?: string | null
+  /** Forecast usage and the scored record for the autopilot's timeframe; null without a forecaster. */
+  forecast_usage?: ForecastUsage | null
   /** Effective risk gate policy; always present. */
   risk_policy: RiskPolicy
   /**
@@ -116,7 +140,7 @@ export type RiskPolicy = {
   maxDailyLossPercent: number
   /** Peak-drawdown breaker, percent below the lifetime peak. */
   maxPeakDrawdownPercent: number
-  /** Cap on net USD-directional exposure in lots (0 disables). */
+  /** Cap on net exposure to any one currency or asset, in lots (0 disables). */
   maxNetFactorLots: number
   /** News blackout either side of a high-impact event, in minutes (0 disables). */
   calendarBlackoutMinutes: number
@@ -711,7 +735,7 @@ export class NotificationError extends Error {
 
 /** An authenticated notification request; throws `NotificationError` on refusal. */
 async function notificationRequest<T>(path: string, method: 'PUT' | 'POST', token: string, body: unknown): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await apiFetch(`${BASE}${path}`, {
     method,
     headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
     body: JSON.stringify(body),
@@ -767,7 +791,7 @@ export type JudgeSettings = {
 
 /** An authenticated judge change; throws the service's reason on refusal. */
 async function judgeRequest<T>(path: string, method: 'PUT' | 'POST' | 'DELETE', token: string, body?: unknown): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await apiFetch(`${BASE}${path}`, {
     method,
     headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -791,8 +815,62 @@ export const judge = {
 
 const BASE = '/api'
 
+type FailureBody = {
+  field?: string
+  reason?: string
+  error?: string
+  rejected?: Array<{ field: string; reason: string }>
+}
+
+/** The service's own words for a refused request, or the status when it gave none. */
+export function failureReason(payload: FailureBody | null, status: number): string {
+  if (payload?.field && payload.reason) return `${payload.field}: ${payload.reason}`
+  if (payload?.rejected?.length) return payload.rejected.map((edit) => `${edit.field}: ${edit.reason.replaceAll('_', ' ')}`).join('; ')
+  if (payload?.reason) return payload.reason
+  if (payload?.error) return payload.error.replaceAll('_', ' ')
+  return `HTTP ${status}`
+}
+
+/** One toast for the whole service being unreachable, however many requests fail. */
+export const SERVICE_TOAST = 'service'
+
+/**
+ * Every console request goes through here, so no failure is visible only in
+ * the network tab. A refused change toasts the service's reason; a failing
+ * read toasts once per endpoint and clears when it next succeeds; an
+ * unreachable service (no answer, or a gateway error without a Veyra body)
+ * is one toast. Callers still receive the response and handle it as before.
+ */
+async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method ?? 'GET').toUpperCase()
+  const path = url.slice(BASE.length).split('?')[0]
+  let response: Response
+  try {
+    response = await fetch(url, init)
+  } catch (error) {
+    if (init.signal?.aborted || (error instanceof DOMException && error.name === 'AbortError')) throw error
+    showToast({ key: SERVICE_TOAST, title: 'Cannot reach the Veyra service', detail: error instanceof Error ? error.message : String(error) })
+    throw error
+  }
+  if (response.ok) {
+    resolveToast(SERVICE_TOAST)
+    if (method === 'GET') resolveToast(`load ${path}`)
+    return response
+  }
+  const payload = (await response.clone().json().catch(() => null)) as FailureBody | null
+  const reason = failureReason(payload, response.status)
+  if (response.status >= 500 && !payload) {
+    showToast({ key: SERVICE_TOAST, title: 'The Veyra service is not answering', detail: `${path}: ${reason}` })
+  } else if (method === 'GET') {
+    showToast({ key: `load ${path}`, title: `Could not load ${path}`, detail: reason })
+  } else {
+    showToast({ title: `${response.status < 500 ? 'Refused' : 'Failed'}: ${method} ${path}`, detail: reason })
+  }
+  return response
+}
+
 async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await apiFetch(`${BASE}${path}`, {
     signal,
     headers: { accept: 'application/json' },
   })
@@ -803,7 +881,7 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await apiFetch(`${BASE}${path}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(body),
@@ -842,7 +920,7 @@ export async function streamAssistant(
   onEvent: (event: AssistantEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(`${BASE}/assistant/chat`, {
+  const response = await apiFetch(`${BASE}/assistant/chat`, {
     method: 'POST',
     signal,
     headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
@@ -896,7 +974,7 @@ export async function changeModelCredential(
   token: string,
   key?: string,
 ): Promise<CredentialSaveResult> {
-  const response = await fetch(`${BASE}/model/credential`, {
+  const response = await apiFetch(`${BASE}/model/credential`, {
     method: key === undefined ? 'DELETE' : 'POST',
     headers: {
       accept: 'application/json',
@@ -916,7 +994,7 @@ export async function changeModelCredential(
 }
 
 async function subscriptionMutation<T>(path: string, method: 'POST' | 'DELETE', token: string, body?: object): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await apiFetch(`${BASE}${path}`, {
     method,
     headers: { accept: 'application/json', 'content-type': 'application/json', 'x-veyra-admin-token': token },
     ...(body ? { body: JSON.stringify(body) } : {}),

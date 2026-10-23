@@ -132,8 +132,8 @@
       `GBPUSD`), read from the reference prices the tick already gathered, so
       the per-trade risk cap prices crosses exactly as it prices majors and
       fails closed (`risk_unverifiable`) when the leg is not in the menu or on
-      the book. Crosses carry no net USD direction — their legs cancel — so
-      they consume none of the directional cap. This makes EURJPY/GBPJPY/
+      the book. For the exposure cap a cross now counts through both of its
+      currencies (see the per-currency cap). This makes EURJPY/GBPJPY/
       AUDJPY and similar crosses *available as options* in the console menu
       without changing any default.
 - [x] Durable runtime state (`runtime_state` in Postgres): judge usage,
@@ -148,6 +148,10 @@
       aggregates wins/losses/win rate, net P/L, profit factor, and per-symbol
       totals, and the console shows it as the Performance panel — proven live
       (the USDJPY take-profit: open 156.198, close 156.410, net +1.36, 1W/0L).
+- [ ] Instrument picker: a read-only `list_symbols` command (EA 1.28) pages
+      the broker's full instrument list into `GET /symbols`, and Settings ->
+      Autopilot -> Instruments chooses from it by market. Built and tested
+      locally; not yet seen against a live terminal.
 - [x] Economic calendar: a provider-neutral `EventCalendar` trait with the
       keyless ForexFactory weekly export as the first implementation (cached),
       `GET /calendar` for operators, per-asset `upcoming_events` in the entry

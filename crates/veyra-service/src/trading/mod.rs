@@ -10,6 +10,7 @@ pub mod agent;
 pub mod autopilot;
 pub mod contract;
 pub mod intent;
+pub(crate) mod judge_record;
 pub mod pipeline;
 
 pub use autopilot::{AutopilotSettings, JevPreference, TickOutcome};

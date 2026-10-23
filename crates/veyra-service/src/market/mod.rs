@@ -9,6 +9,7 @@
 //! channel. Adding a REST or exchange provider means adding an implementation
 //! plus a provider selector; callers do not change.
 
+pub mod cache;
 pub mod ea;
 pub mod settings;
 
@@ -53,7 +54,7 @@ impl fmt::Display for MarketProvider {
 }
 
 /// Chart timeframe a candle series is aggregated at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Timeframe {
     /// One minute.
     M1,
@@ -346,6 +347,17 @@ pub trait MarketFeed: Send + Sync + fmt::Debug + 'static {
     /// Returns [`MarketError::Unavailable`] when the provider cannot answer
     /// and [`MarketError::Contract`] when its response is unusable.
     async fn symbol_spec(&self, symbol: &Symbol) -> Result<SymbolSpecPayload, MarketError>;
+
+    /// Fetches the venue's contract from the venue itself, bypassing any
+    /// cache. Order admission uses this because the contract's quote prices
+    /// the stop the risk gate measures. Feeds without a cache need not
+    /// override it.
+    ///
+    /// # Errors
+    /// As [`MarketFeed::symbol_spec`].
+    async fn fresh_symbol_spec(&self, symbol: &Symbol) -> Result<SymbolSpecPayload, MarketError> {
+        self.symbol_spec(symbol).await
+    }
 }
 
 /// Active market-data integration selected by configuration.
@@ -387,6 +399,17 @@ impl MarketRuntime {
     pub fn from_feed(feed: Arc<dyn MarketFeed>) -> Self {
         let provider = feed.provider();
         Self { provider, feed }
+    }
+
+    /// Puts a [`cache::CachedFeed`] in front of the active feed, so repeated
+    /// reads of closed candles and contracts are answered from memory.
+    /// `offset` reports the broker clock's offset from UTC, which places bar
+    /// closes; see the cache module for what is held and for how long.
+    pub fn cached(self, offset: cache::OffsetSource) -> Self {
+        Self {
+            provider: self.provider,
+            feed: Arc::new(cache::CachedFeed::new(self.feed, offset)),
+        }
     }
 
     /// Provider identifier of the active implementation.
@@ -528,5 +551,15 @@ mod tests {
 
         let runtime = MarketRuntime::from_feed(Arc::new(StubFeed));
         assert_eq!(runtime.provider(), MarketProvider::Ea);
+
+        // Without its own override, a fresh read is the ordinary read.
+        let error = actix_web::rt::System::new()
+            .block_on(runtime.feed().fresh_symbol_spec(&symbol()))
+            .expect_err("stub has no contract");
+        assert!(error.to_string().contains("no contract data"));
+
+        let cached = runtime.cached(Arc::new(|| Some(7_200)));
+        assert_eq!(cached.provider(), MarketProvider::Ea);
+        assert!(format!("{:?}", cached.feed()).contains("CachedFeed"));
     }
 }

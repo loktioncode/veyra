@@ -50,6 +50,10 @@ pub enum StateKey {
     JudgeOpenAiKey,
     /// Last broker-clock offset and terminal build (see [`crate::terminal`]).
     Terminal,
+    /// Cumulative forecast calls, failures, and billed tokens.
+    ForecastUsage,
+    /// Waiting and scored forecasts behind the forecast record.
+    ForecastBook,
 }
 
 impl StateKey {
@@ -71,6 +75,8 @@ impl StateKey {
             Self::JudgePrefs => "judge_prefs",
             Self::JudgeOpenAiKey => "judge_openai_key",
             Self::Terminal => "terminal",
+            Self::ForecastUsage => "forecast_usage",
+            Self::ForecastBook => "forecast_book",
         }
     }
 }
@@ -305,6 +311,8 @@ mod tests {
         assert_eq!(StateKey::NotifySecrets.as_str(), "notify_secrets");
         assert_eq!(StateKey::JudgePrefs.as_str(), "judge_prefs");
         assert_eq!(StateKey::JudgeOpenAiKey.as_str(), "judge_openai_key");
+        assert_eq!(StateKey::ForecastUsage.as_str(), "forecast_usage");
+        assert_eq!(StateKey::ForecastBook.as_str(), "forecast_book");
     }
 
     #[actix_web::test]

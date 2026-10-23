@@ -3,10 +3,11 @@
 //! Secrets stay inside a redacted newtype, and parsing fails closed on partial
 //! configuration so a half-configured provider never reaches request time.
 //!
-//! `VEYRA_MODEL_PREFER_SUBSCRIPTION` and `VEYRA_MODEL_CHATGPT_MODEL` only shape
-//! how a configured provider is routed (ChatGPT subscription first), so on
-//! their own they neither enable model integration nor require a key; they are
-//! still validated whenever they are set.
+//! `VEYRA_MODEL_PREFER_SUBSCRIPTION`, `VEYRA_MODEL_CHATGPT_MODEL`, and
+//! `VEYRA_MODEL_CLAUDE_MODEL` only shape how a configured provider is routed
+//! (connected subscriptions first), so on their own they neither enable model
+//! integration nor require a key; they are still validated whenever they are
+//! set.
 //!
 //! Tier models must accept a *forced tool call*: the structured path enforces
 //! the response schema through `tool_choice`, and reasoning modes that reject
@@ -24,6 +25,9 @@ use reqwest::Url;
 
 /// ChatGPT subscription model used when `VEYRA_MODEL_CHATGPT_MODEL` is empty.
 pub const DEFAULT_CHATGPT_MODEL: &str = "gpt-6-luna";
+
+/// Claude subscription model used when `VEYRA_MODEL_CLAUDE_MODEL` is empty.
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5-5";
 
 /// Z.AI's OpenAI-compatible endpoint, used unless `VEYRA_MODEL_BASE_URL`
 /// overrides it.
@@ -137,6 +141,7 @@ pub struct ModelSettings {
     budget: crate::model::BudgetPolicy,
     prefer_subscription: bool,
     chatgpt_model: String,
+    claude_model: String,
 }
 
 impl ModelSettings {
@@ -180,6 +185,7 @@ impl ModelSettings {
         let reasoning_fallbacks_raw = optional(&mut source, "VEYRA_MODEL_REASONING_FALLBACKS");
         let prefer_raw = optional(&mut source, "VEYRA_MODEL_PREFER_SUBSCRIPTION");
         let chatgpt_raw = optional(&mut source, "VEYRA_MODEL_CHATGPT_MODEL");
+        let claude_raw = optional(&mut source, "VEYRA_MODEL_CLAUDE_MODEL");
 
         // Validated up front so a malformed value is refused even while the
         // model section is otherwise empty; neither enables the section.
@@ -200,6 +206,15 @@ impl ModelSettings {
                 ModelProvider::Codex,
                 "VEYRA_MODEL_CHATGPT_MODEL",
                 &chatgpt_raw,
+            )?
+        };
+        let claude_model = if claude_raw.is_empty() {
+            DEFAULT_CLAUDE_MODEL.to_owned()
+        } else {
+            validate_model_identifier(
+                ModelProvider::ClaudeCode,
+                "VEYRA_MODEL_CLAUDE_MODEL",
+                &claude_raw,
             )?
         };
 
@@ -365,6 +380,7 @@ impl ModelSettings {
             budget,
             prefer_subscription,
             chatgpt_model,
+            claude_model,
         }))
     }
 
@@ -426,8 +442,8 @@ impl ModelSettings {
         &self.budget
     }
 
-    /// Whether a connected ChatGPT subscription is tried before the
-    /// configured provider. Defaults to true.
+    /// Whether connected subscriptions (ChatGPT, then Claude) are tried
+    /// before the configured provider. Defaults to true.
     pub fn prefer_subscription(&self) -> bool {
         self.prefer_subscription
     }
@@ -436,6 +452,12 @@ impl ModelSettings {
     /// the configured API tier models.
     pub fn chatgpt_model(&self) -> &str {
         &self.chatgpt_model
+    }
+
+    /// Model sent to the Claude subscription for every tier; never one of
+    /// the configured API tier models.
+    pub fn claude_model(&self) -> &str {
+        &self.claude_model
     }
 
     /// Whether both settings route the same candidates through the same
@@ -449,6 +471,7 @@ impl ModelSettings {
             && self.compel_structured_answer == other.compel_structured_answer
             && self.prefer_subscription == other.prefer_subscription
             && self.chatgpt_model == other.chatgpt_model
+            && self.claude_model == other.claude_model
     }
 }
 
@@ -1062,10 +1085,12 @@ mod tests {
             .expect("configured");
         assert!(settings.prefer_subscription());
         assert_eq!(settings.chatgpt_model(), DEFAULT_CHATGPT_MODEL);
+        assert_eq!(settings.claude_model(), DEFAULT_CLAUDE_MODEL);
 
         let settings = ModelSettings::from_source(source(&full(&[
             ("VEYRA_MODEL_PREFER_SUBSCRIPTION", "false"),
             ("VEYRA_MODEL_CHATGPT_MODEL", "gpt-5.6-terra"),
+            ("VEYRA_MODEL_CLAUDE_MODEL", "claude-opus-5-5"),
         ])))
         .expect("settings parse")
         .expect("configured");
@@ -1075,10 +1100,16 @@ mod tests {
             "gpt-5.6-terra",
             "a native ChatGPT id needs no vendor prefix"
         );
+        assert_eq!(
+            settings.claude_model(),
+            "claude-opus-5-5",
+            "a native Claude id needs no vendor prefix"
+        );
 
         for (name, value) in [
             ("VEYRA_MODEL_PREFER_SUBSCRIPTION", "yes"),
             ("VEYRA_MODEL_CHATGPT_MODEL", "gpt 6"),
+            ("VEYRA_MODEL_CLAUDE_MODEL", "claude sonnet"),
         ] {
             let error = ModelSettings::from_source(source(&full(&[(name, value)])))
                 .expect_err("malformed values are refused");

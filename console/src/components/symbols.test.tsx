@@ -48,12 +48,13 @@ afterEach(() => {
 })
 
 /** A controlled host, as the settings panel is. */
-function Harness({ initial = '', onValue }: { initial?: string; onValue?: (value: string) => void }) {
+function Harness({ initial = '', max, onValue }: { initial?: string; max?: number; onValue?: (value: string) => void }) {
   const [value, setValue] = useState(initial)
   return (
     <SymbolPicker
       label="Instruments"
       value={value}
+      max={max}
       onChange={(next) => {
         setValue(next)
         onValue?.(next)
@@ -163,6 +164,18 @@ describe('SymbolPicker', () => {
     expect(boxes.filter((box) => box.checked).every((box) => !box.disabled)).toBe(true)
   })
 
+  it('stops at the configured limit instead of the default', async () => {
+    const many = Array.from({ length: 5 }, (_, index) => entry(`PAIR${index + 1}`, 'forex'))
+    vi.spyOn(api, 'symbols').mockResolvedValue(readyCatalog(many))
+    render(<Harness initial="PAIR1,PAIR2" max={2} />)
+    const dialog = await openPicker()
+    await within(dialog).findByText(/5 instruments/)
+
+    expect(within(dialog).getByText('2 of 2 chosen')).toBeTruthy()
+    const boxes = within(dialog).getAllByRole('checkbox') as HTMLInputElement[]
+    expect(boxes.filter((box) => !box.checked).every((box) => box.disabled)).toBe(true)
+  })
+
   it('pages a very long list so every instrument can be reached', async () => {
     const huge = Array.from({ length: 120 }, (_, index) => entry(`SYM${String(index).padStart(3, '0')}`, 'stocks'))
     vi.spyOn(api, 'symbols').mockResolvedValue(readyCatalog(huge))
@@ -214,6 +227,18 @@ describe('SymbolPicker', () => {
     expect(update).not.toHaveBeenCalled()
   })
 
+  it('says when the risk gate is too full instead of sending a list it would refuse', async () => {
+    vi.spyOn(api, 'symbols').mockResolvedValue(readyCatalog(MARKETS))
+    const full = Array.from({ length: 63 }, (_, index) => `HELD${index}`)
+    vi.spyOn(api, 'riskPolicy').mockResolvedValue({ symbols: full } as Awaited<ReturnType<typeof api.riskPolicy>>)
+    const update = vi.spyOn(api, 'updatePolicy')
+    render(<Harness initial="GBPUSD,US30" />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Allow GBPUSD, US30 in the risk gate' }))
+    expect(await screen.findByText(/already allows 63 of its 64 instruments, so 2 more will not fit/)).toBeTruthy()
+    expect(update).not.toHaveBeenCalled()
+  })
+
   it('lets an instrument be typed in while the terminal has not listed any', async () => {
     vi.spyOn(api, 'symbols').mockResolvedValue({ ready: false, reason: 'waiting for the terminal', categories: [], symbols: [] })
     const values: string[] = []
@@ -238,7 +263,7 @@ describe('SymbolPicker', () => {
     const dialog = await openPicker()
     expect(
       await within(dialog).findByText(
-        'The MetaTrader EA is too old to list instruments. Recompile VeyraProbe (version 1.27 or newer) and reload it on the chart.',
+        'The MetaTrader EA is too old to list instruments. Recompile VeyraProbe (version 1.28 or newer) and reload it on the chart.',
       ),
     ).toBeTruthy()
     // Typing an instrument in still works meanwhile.

@@ -93,7 +93,7 @@ export function SubscriptionConnections({ enabled, selectedProvider, onRefresh }
       setCallback('')
       setToken('')
       const refreshed = await refresh()
-      setMessage(`Subscription connected. Choose its provider and model IDs below, then Apply.${refreshed ? '' : ' Connection status could not be refreshed.'}`)
+      setMessage(`Subscription connected. It now answers before the provider below.${refreshed ? '' : ' Connection status could not be refreshed.'}`)
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Could not complete sign-in.')
     } finally {
