@@ -19,7 +19,7 @@ Status at a glance (see `README.md` and `docs/roadmap.md` for evidence):
 | Venue contracts (`symbol_spec`) | Live-proven against IFC Markets: spread, stop level, lot band, margin per lot, and swap rates for every menu symbol; pre-queue lot/margin/stop checks and a console-editable ATR(14) noise floor |
 | Decision model | Live-proven structured answers over the OpenRouter preset |
 | Jev judgements | Live-proven (`jev-1.13.0`, ~1.3 s per request) |
-| Range forecasts (Clairic) | Built and tested against a local mock of the documented Workers AI request and response; not yet run against Cloudflare. Off until `VEYRA_FORECAST_PROVIDER` and its account and token are set |
+| Range forecasts (Clairic) | Built and tested against a local mock of the documented Workers AI request and response, and run live against Cloudflare Workers AI (an ignored test, `clairic_answers_a_range_request_within_its_bounds`, plus the Pi's running service: 25 calls, no failures at the last check). Only 12 forecasts were scored then, too few to judge calibration. Off until `VEYRA_FORECAST_PROVIDER` and its account and token are set |
 | OpenAI Decisions judge | Built and tested against a local mock only. The live endpoint answers `403 "Decision API is not enabled for this user."` (limited preview), so no real OpenAI judgement has been seen and its wire format is assumed, not verified. Off by default; Jev answers whenever it fails |
 | Economic calendar | Live-proven (ForexFactory weekly export; high-impact blackout and per-asset event context) |
 | Risk gate + `order_check` | Live-proven (retcode 0 and 129 for validation, without sending an order) |
