@@ -213,7 +213,7 @@ impl Tool {
                 json!({"type":"object","properties":{
                     "symbol": {"type":"string"},
                     "ticket": {"type":"integer","minimum":1},
-                    "kinds": {"type":"array","maxItems":14,"items":{"type":"string","enum": crate::audit::AuditKind::ALL.map(crate::audit::AuditKind::as_str)},"description":"Event kinds; default proposal_evaluated, position_closed, command_failed."},
+                    "kinds": {"type":"array","maxItems":16,"items":{"type":"string","enum": crate::audit::AuditKind::ALL.map(crate::audit::AuditKind::as_str)},"description":"Event kinds; default proposal_evaluated, position_closed, command_failed."},
                     "outcome": {"type":"string"},
                     "since": instant_schema("start"),
                     "until": instant_schema("end"),

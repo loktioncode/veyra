@@ -36,8 +36,8 @@ use crate::broker::command::{
 };
 use crate::broker::settings::EaToken;
 use crate::broker::{
-    AccountLogin, AccountSnapshot, BrokerError, BrokerLink, BrokerProvider, LinkReport,
-    ORDER_MAGIC, ServerName, Symbol,
+    AccountIdentity, AccountLogin, AccountSnapshot, BrokerError, BrokerLink, BrokerProvider,
+    LinkReport, ORDER_MAGIC, ServerName, Symbol,
 };
 
 /// Message kinds accepted from the EA.
@@ -299,6 +299,10 @@ enum CommandRequest {
 #[derive(Debug)]
 struct StoredAccount {
     payload: AccountSnapshotPayload,
+    /// The account the latest heartbeat named when this snapshot was
+    /// acknowledged; `None` before the first heartbeat. The snapshot payload
+    /// itself carries no account number, so this is the pairing.
+    identity: Option<AccountIdentity>,
     at: SystemTime,
     observed_at: Instant,
 }
@@ -589,10 +593,13 @@ impl EaLink {
             }
         });
         if let Some(snapshot) = retained {
+            let identity =
+                self.with_state(|slot| slot.as_ref().map(|state| state.snapshot.identity()));
             let replaced = self.with_last_account(|slot| {
                 let previous = slot.take();
                 *slot = Some(StoredAccount {
                     payload: snapshot,
+                    identity,
                     at: SystemTime::now(),
                     observed_at: Instant::now(),
                 });
@@ -829,9 +836,26 @@ impl EaLink {
         self.with_last_account(|slot| {
             *slot = Some(StoredAccount {
                 payload,
+                identity: None,
                 at: SystemTime::now(),
                 observed_at: Instant::now(),
             });
+        });
+    }
+
+    /// Test-only hatch like [`Self::retain_snapshot`], for a snapshot read
+    /// from a known account.
+    #[cfg(test)]
+    pub(crate) fn retain_snapshot_from(
+        &self,
+        payload: AccountSnapshotPayload,
+        identity: AccountIdentity,
+    ) {
+        self.retain_snapshot(payload);
+        self.with_last_account(|slot| {
+            if let Some(stored) = slot.as_mut() {
+                stored.identity = Some(identity);
+            }
         });
     }
 
@@ -841,6 +865,13 @@ impl EaLink {
     /// (risk facts, reconciliation) use it instead of querying the terminal.
     pub fn last_account(&self) -> Option<AccountSnapshotPayload> {
         self.with_last_account(|slot| slot.as_ref().map(|stored| stored.payload.clone()))
+    }
+
+    /// The account the retained snapshot was read from: what the latest
+    /// heartbeat named when the snapshot was acknowledged. `None` when there
+    /// is no snapshot or no heartbeat had arrived yet.
+    pub fn last_account_identity(&self) -> Option<AccountIdentity> {
+        self.with_last_account(|slot| slot.as_ref().and_then(|stored| stored.identity.clone()))
     }
 
     /// Age of the retained account snapshot, when one exists.
@@ -1007,6 +1038,10 @@ impl BrokerLink for EaLink {
 
     fn last_account(&self) -> Option<AccountSnapshotPayload> {
         EaLink::last_account(self)
+    }
+
+    fn last_account_identity(&self) -> Option<AccountIdentity> {
+        EaLink::last_account_identity(self)
     }
 
     fn last_account_age(&self, now: SystemTime) -> Option<Duration> {
@@ -3151,5 +3186,68 @@ mod tests {
             error: Some("nope".to_owned()),
         });
         assert_eq!(link.last_account().expect("previous retained").orders, 3);
+    }
+
+    #[test]
+    fn a_retained_snapshot_is_paired_with_the_account_the_heartbeat_named() {
+        use crate::broker::{AccountLogin, AccountSnapshot, ServerName, Symbol};
+
+        let link = EaLink::new(
+            EaToken::parse("test-token-1234567890").expect("token"),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        let heartbeat = |login: i64| {
+            AccountSnapshot::new(
+                AccountLogin::parse(login).expect("login"),
+                ServerName::parse("IFCMarkets-Demo").expect("server"),
+                Symbol::parse("EURUSD").expect("symbol"),
+                true,
+                true,
+                0,
+                0.0,
+            )
+        };
+        let acknowledge = |link: &EaLink| {
+            let id = link.enqueue(CommandKind::AccountSnapshot);
+            link.apply_ack(&EaAck {
+                id,
+                ok: true,
+                data: Some(serde_json::json!({
+                    "balance": 100.0, "equity": 100.0, "freeMargin": 100.0,
+                    "orders": 0, "lots": 0.0, "positions": [],
+                    "positionsTruncated": false, "serverTime": 1_758_000_000
+                })),
+                error: None,
+            });
+        };
+
+        // A snapshot acknowledged before any heartbeat names no account.
+        acknowledge(&link);
+        assert!(link.last_account().is_some());
+        assert_eq!(link.last_account_identity(), None);
+
+        link.record(heartbeat(94_168));
+        acknowledge(&link);
+        assert_eq!(
+            link.last_account_identity()
+                .map(|identity| identity.login().value()),
+            Some(94_168)
+        );
+
+        // A newer heartbeat does not re-label the snapshot already retained;
+        // the next acknowledgement picks the new account up.
+        link.record(heartbeat(55_001));
+        assert_eq!(
+            link.last_account_identity()
+                .map(|identity| identity.login().value()),
+            Some(94_168)
+        );
+        acknowledge(&link);
+        assert_eq!(
+            link.last_account_identity()
+                .map(|identity| identity.login().value()),
+            Some(55_001)
+        );
     }
 }

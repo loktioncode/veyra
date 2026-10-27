@@ -232,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // terminal, then a week every 15 minutes (read-only history commands).
     actix_web::rt::spawn(veyra_service::ledger::sync_forever(state.clone()));
     actix_web::rt::spawn(veyra_service::terminal::watch(state.clone()));
+    actix_web::rt::spawn(veyra_service::risk::guard::watch(state.clone()));
 
     // Notification sources: read-only watchers of the audit feed and of
     // health transitions. They only queue messages; delivery never blocks.

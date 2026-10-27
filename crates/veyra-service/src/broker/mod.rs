@@ -134,6 +134,38 @@ impl AccountLogin {
     }
 }
 
+/// Which trading account a reading belongs to: the account number on its
+/// server. Both parts are what the terminal's heartbeat already reports (and
+/// what the balance audit already records); no credential is involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    login: AccountLogin,
+    server: ServerName,
+}
+
+impl AccountIdentity {
+    /// Pairs an account number with the server it lives on.
+    pub fn new(login: AccountLogin, server: ServerName) -> Self {
+        Self { login, server }
+    }
+
+    /// Account number.
+    pub fn login(&self) -> AccountLogin {
+        self.login
+    }
+
+    /// Broker server name.
+    pub fn server(&self) -> &ServerName {
+        &self.server
+    }
+}
+
+impl fmt::Display for AccountIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}@{}", self.login.value(), self.server.as_str())
+    }
+}
+
 /// See [`Symbol::six_letter_code`]; also used for raw names that have not
 /// been parsed into a [`Symbol`].
 ///
@@ -289,6 +321,11 @@ impl AccountSnapshot {
         &self.server
     }
 
+    /// The account this snapshot describes: its number and server.
+    pub fn identity(&self) -> AccountIdentity {
+        AccountIdentity::new(self.login, self.server.clone())
+    }
+
     /// Symbol of the chart hosting the terminal side of the link.
     pub fn symbol(&self) -> &Symbol {
         &self.symbol
@@ -396,6 +433,13 @@ pub trait BrokerLink: Send + Sync + fmt::Debug + 'static {
 
     /// Latest validated account snapshot, if the venue ever reported one.
     fn last_account(&self) -> Option<AccountSnapshotPayload>;
+
+    /// The account the latest [`BrokerLink::last_account`] snapshot was read
+    /// from, when the venue can say. `None` means unknown, never "no
+    /// account": callers must not treat it as a change of account.
+    fn last_account_identity(&self) -> Option<AccountIdentity> {
+        None
+    }
 
     /// Age of the latest validated snapshot, if there is one.
     fn last_account_age(&self, now: SystemTime) -> Option<Duration>;

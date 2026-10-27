@@ -88,11 +88,14 @@ pub enum AuditKind {
     RuntimeConfigUpdated,
     /// The trading terminal reported a different build (it updated itself).
     TerminalChanged,
+    /// The terminal moved to a different trading account and the drawdown
+    /// baselines were reset (old and new account number and server).
+    AccountChanged,
 }
 
 impl AuditKind {
     /// Every category, in declaration order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::CommandQueued,
         Self::CommandCompleted,
         Self::CommandFailed,
@@ -108,6 +111,7 @@ impl AuditKind {
         Self::RiskPolicyUpdated,
         Self::RuntimeConfigUpdated,
         Self::TerminalChanged,
+        Self::AccountChanged,
     ];
 
     /// Parses a stable wire name; unknown names are rejected.
@@ -133,6 +137,7 @@ impl AuditKind {
             Self::RiskPolicyUpdated => "risk_policy_updated",
             Self::RuntimeConfigUpdated => "runtime_config_updated",
             Self::TerminalChanged => "terminal_changed",
+            Self::AccountChanged => "account_changed",
         }
     }
 }
