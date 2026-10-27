@@ -1789,7 +1789,8 @@ fn eligible_entry_markets(
         .iter()
         .filter(|(symbol, _)| {
             let schedule_open = policy.allows_weekend(symbol)
-                || crate::risk::window::entry_block(now, None).is_none();
+                || crate::risk::window::entry_block_with(now, None, policy.rollover_pause())
+                    .is_none();
             let contract_open = match symbol_spec_for(specs, symbol.as_str()) {
                 Some(spec) => {
                     spec.trade_allowed
@@ -1837,7 +1838,8 @@ fn empty_entry_reason(
         && markets
             .iter()
             .all(|(symbol, _)| !policy.allows_weekend(symbol))
-        && let Some(block) = crate::risk::window::entry_block(now, None)
+        && let Some(block) =
+            crate::risk::window::entry_block_with(now, None, policy.rollover_pause())
     {
         return block.as_str();
     }

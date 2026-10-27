@@ -394,9 +394,11 @@ impl RiskGate {
         }
         // The standard calendar guards apply to FX, metals, and indices.
         // Explicit weekend-capable instruments use the live venue contract
-        // instead, because their maintenance hours are provider-specific.
+        // instead, because their maintenance hours are provider-specific. The
+        // operator may switch the nightly rollover pause off; the weekend
+        // guards stay.
         if !policy.allows_weekend(draft.symbol())
-            && crate::risk::window::entry_block(now, None).is_some()
+            && crate::risk::window::entry_block_with(now, None, policy.rollover_pause()).is_some()
         {
             return Err(RiskCode::MarketWindowClosed);
         }
@@ -927,6 +929,30 @@ mod tests {
             gate.evaluate(&draft(0.1), facts(0), wednesday),
             RiskDecision::Approved(_)
         ));
+    }
+
+    #[test]
+    fn switching_the_nightly_pause_off_admits_rollover_entries_but_not_the_weekend() {
+        let gate = RiskGate::new(policy().with_rollover_pause(false));
+        // Thursday 2026-01-08 21:00 UTC: inside the rollover blackout.
+        let rollover = UNIX_EPOCH + Duration::from_secs(1_767_906_000);
+        assert!(matches!(
+            gate.evaluate(&draft(0.1), facts(0), rollover),
+            RiskDecision::Approved(_)
+        ));
+
+        // Friday 2026-01-09 20:00 UTC: the weekend cutoff still holds.
+        let friday_evening = UNIX_EPOCH + Duration::from_secs(1_767_988_800);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.1), facts(0), friday_evening)).code(),
+            RiskCode::MarketWindowClosed
+        );
+        // Saturday 2026-01-10 12:00 UTC: the market is closed.
+        let saturday = UNIX_EPOCH + Duration::from_secs(1_768_046_400);
+        assert_eq!(
+            expect_rejection(gate.evaluate(&draft(0.1), facts(0), saturday)).code(),
+            RiskCode::MarketWindowClosed
+        );
     }
 
     #[test]

@@ -979,8 +979,9 @@ pub async fn market_candles(state: Data<AppState>, query: web::Query<CandleQuery
 /// Read-only and computed from the clock: the FX/metals week opens Sunday
 /// 21:00 UTC, closes Friday 21:00 UTC, and pauses daily 21:00-22:00 UTC
 /// Monday through Thursday. The `entries` block reports whether *our* policy
-/// currently admits entries (rollover blackout, Friday cutoff, Sunday reopen,
-/// or the configured session window), so the console can show both the market
+/// currently admits entries (rollover blackout unless the operator switched
+/// the nightly pause off, Friday cutoff, Sunday reopen, or the configured
+/// session window), so the console can show both the market
 /// and the bot's own hours. The `weekend` block reports the open-position
 /// preference and the countdown to the pre-close checkpoint, which runs in the
 /// final two hours before Friday's close.
@@ -991,8 +992,8 @@ pub async fn market_sessions(state: Data<AppState>) -> HttpResponse {
     let Some(session) = window::market_session(now) else {
         return HttpResponse::ServiceUnavailable().json(json!({ "error": "clock_unavailable" }));
     };
-    let block = window::entry_block(now, state.risk().policy().session());
     let policy = state.risk().policy();
+    let block = window::entry_block_with(now, policy.session(), policy.rollover_pause());
     let now_unix = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)
@@ -1012,7 +1013,8 @@ pub async fn market_sessions(state: Data<AppState>) -> HttpResponse {
         "policy": {
             "rolloverBlackout": {
                 "startMinute": window::ROLLOVER_START_MINUTE,
-                "endMinute": window::ROLLOVER_END_MINUTE
+                "endMinute": window::ROLLOVER_END_MINUTE,
+                "enabled": policy.rollover_pause()
             },
             "fridayEntryCutoffMinute": window::FRIDAY_CUTOFF_MINUTE,
             "sundayEntryOpenMinute": window::SUNDAY_OPEN_MINUTE

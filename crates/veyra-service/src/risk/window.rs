@@ -240,7 +240,24 @@ pub fn in_rollover(minute: u32) -> bool {
 
 /// Why entries are blocked at `now`, combining the configured session with the
 /// built-in rollover and weekend guards. `None` means the window is open.
+///
+/// The rollover blackout is always applied here; use [`entry_block_with`] when
+/// the operator may have switched the nightly pause off.
 pub fn entry_block(now: SystemTime, session: Option<SessionWindow>) -> Option<WindowBlock> {
+    entry_block_with(now, session, true)
+}
+
+/// [`entry_block`] with the daily rollover blackout optional.
+///
+/// `rollover_pause` is the operator's nightly-pause setting. Turning it off
+/// lifts only the rollover blackout: the Friday cutoff, the Sunday reopen, and
+/// the configured session window still block entries, and an instrument whose
+/// own venue session is closed is still refused by the venue-session check.
+pub fn entry_block_with(
+    now: SystemTime,
+    session: Option<SessionWindow>,
+    rollover_pause: bool,
+) -> Option<WindowBlock> {
     let (weekday, minute) = utc_parts(now)?;
     // Sunday = 0, Friday = 5, Saturday = 6.
     if weekday == 6 {
@@ -252,7 +269,7 @@ pub fn entry_block(now: SystemTime, session: Option<SessionWindow>) -> Option<Wi
     if weekday == 0 && minute < SUNDAY_OPEN_MINUTE {
         return Some(WindowBlock::WeekendOpen);
     }
-    if in_rollover(minute) {
+    if rollover_pause && in_rollover(minute) {
         return Some(WindowBlock::RolloverBlackout);
     }
     if let Some(window) = session {
@@ -484,6 +501,27 @@ mod tests {
         assert_eq!(
             entry_block(summer_rollover, None),
             Some(WindowBlock::RolloverBlackout)
+        );
+    }
+
+    #[test]
+    fn switching_the_nightly_pause_off_lifts_only_the_rollover_blackout() {
+        let summer_rollover = wednesday_noon() + Duration::from_secs(9 * 3_600);
+        assert_eq!(entry_block_with(summer_rollover, None, false), None);
+        assert_eq!(
+            entry_block_with(summer_rollover, None, true),
+            entry_block(summer_rollover, None)
+        );
+        // The weekend guards and the configured session do not follow it.
+        let friday_evening = wednesday_noon() + Duration::from_secs(2 * 86_400 + 8 * 3_600);
+        assert_eq!(
+            entry_block_with(friday_evening, None, false),
+            Some(WindowBlock::WeekendApproach)
+        );
+        let session = SessionWindow::parse("7-20").expect("session");
+        assert_eq!(
+            entry_block_with(summer_rollover, Some(session), false),
+            Some(WindowBlock::SessionClosed)
         );
     }
 

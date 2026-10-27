@@ -398,7 +398,7 @@ export function SessionPanel({
           label="Rollover"
           value={
             sessions
-              ? `${utcMinute(sessions.policy.rolloverBlackout.startMinute)}–${utcMinute(sessions.policy.rolloverBlackout.endMinute)} UTC`
+              ? `${utcMinute(sessions.policy.rolloverBlackout.startMinute)}–${utcMinute(sessions.policy.rolloverBlackout.endMinute)} UTC${sessions.policy.rolloverBlackout.enabled === false ? ' · off' : ''}`
               : undefined
           }
         />
@@ -727,6 +727,7 @@ export function ModelRoutePanel({
 type PolicyDraft = {
   killSwitch: boolean
   allowTradingWithoutJev: boolean
+  rolloverPause: boolean
   weekendPositions: WeekendPositions
   dailyLossReset: DailyLossReset
   dailyLossBasis: DailyLossBasis
@@ -840,6 +841,8 @@ const POLICY_NUMBER_FIELDS: Array<{ key: NumericDraftKey; label: string; integer
 const POLICY_HELP = {
   killSwitch: 'Blocks new orders; open positions stay open.',
   judgeBypass: 'Lets trading continue while the judge cannot answer.',
+  rolloverPause:
+    'No new trades around the daily rollover (20:45–22:15 UTC), when spreads widen. Turn off to keep trading through it; the weekend cutoff stays.',
   symbols: 'Comma-separated instruments the risk gate approves, 1 to 64. To stop trading, use the kill switch.',
   weekendSymbols: 'Instruments from Symbols whose market trades through the weekend, such as BTCUSD.',
   sessionUtc: 'UTC hours in which new orders are allowed, such as 7-21 or 22-6 across midnight; empty is always.',
@@ -853,6 +856,7 @@ function draftFromPolicy(policy: RiskPolicy): PolicyDraft {
   return {
     killSwitch: policy.killSwitch,
     allowTradingWithoutJev: policy.allowTradingWithoutJev,
+    rolloverPause: policy.rolloverPause ?? true,
     weekendPositions: policy.weekendPositions,
     dailyLossReset: policy.dailyLossReset ?? 'utc',
     dailyLossBasis: policy.dailyLossBasis ?? 'equity',
@@ -879,6 +883,7 @@ function patchFromDraft(draft: PolicyDraft): { patch: RiskPolicyPatch } | { erro
   const patch: RiskPolicyPatch = {
     killSwitch: draft.killSwitch,
     allowTradingWithoutJev: draft.allowTradingWithoutJev,
+    rolloverPause: draft.rolloverPause,
     weekendPositions: draft.weekendPositions,
     dailyLossReset: draft.dailyLossReset,
     dailyLossBasis: draft.dailyLossBasis,
@@ -948,7 +953,7 @@ function PolicySwitch({
   label: string
   help: string
   checked: boolean
-  tone: 'bad' | 'warn'
+  tone: 'ok' | 'bad' | 'warn'
   onFlip: () => void
 }) {
   return (
@@ -991,7 +996,7 @@ export function RiskPanel({
     const value = event.target.value
     setDraft((current) => current && { ...current, [key]: value })
   }
-  const flip = (key: 'killSwitch' | 'allowTradingWithoutJev') =>
+  const flip = (key: 'killSwitch' | 'allowTradingWithoutJev' | 'rolloverPause') =>
     setDraft((current) => current && { ...current, [key]: !current[key] })
   const choose = <K extends 'weekendPositions' | 'dailyLossReset' | 'dailyLossBasis'>(key: K) => (value: PolicyDraft[K]) =>
     setDraft((current) => current && { ...current, [key]: value })
@@ -1045,6 +1050,13 @@ export function RiskPanel({
             checked={draft.allowTradingWithoutJev}
             tone="warn"
             onFlip={() => flip('allowTradingWithoutJev')}
+          />
+          <PolicySwitch
+            label="Nightly pause"
+            help={POLICY_HELP.rolloverPause}
+            checked={draft.rolloverPause}
+            tone="ok"
+            onFlip={() => flip('rolloverPause')}
           />
           <TextControl
             label="Symbols"
@@ -1195,6 +1207,11 @@ export function RiskPanel({
           label="Judge outage"
           value={view((current) => (current.allowTradingWithoutJev ? 'Keeps trading' : 'Pauses decisions'))}
           tone={policy?.allowTradingWithoutJev ? 'tone-warn' : undefined}
+        />
+        <Field
+          label="Nightly pause"
+          value={view((current) => ((current.rolloverPause ?? true) ? 'On' : 'Off · trades through rollover'))}
+          tone={policy?.rolloverPause === false ? 'tone-warn' : undefined}
         />
         <Field
           label="Execution"

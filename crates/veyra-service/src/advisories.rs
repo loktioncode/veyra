@@ -130,12 +130,18 @@ fn window_advisories(
     now: SystemTime,
     session: Option<crate::risk::SessionWindow>,
     weekend_symbols: &[Symbol],
+    rollover_pause: bool,
 ) -> Vec<Advisory> {
-    let Some(block) = window::entry_block(now, session) else {
+    let Some(block) = window::entry_block_with(now, session, rollover_pause) else {
         return Vec::new();
     };
     let reopen = next_open(unix_secs(now), |at| {
-        window::entry_block(UNIX_EPOCH + Duration::from_secs(at.max(0) as u64), session).is_none()
+        window::entry_block_with(
+            UNIX_EPOCH + Duration::from_secs(at.max(0) as u64),
+            session,
+            rollover_pause,
+        )
+        .is_none()
     })
     .map(|at| at * 1_000);
     let still_trading = (!weekend_symbols.is_empty()).then(|| {
@@ -614,7 +620,12 @@ pub async fn collect(state: &AppState) -> Vec<Advisory> {
         items.push(skipped);
     }
 
-    let window_items = window_advisories(now, policy.session(), policy.weekend_symbols());
+    let window_items = window_advisories(
+        now,
+        policy.session(),
+        policy.weekend_symbols(),
+        policy.rollover_pause(),
+    );
     let fx_week_open = window_items
         .iter()
         .all(|item| item.id == "rollover_pause" || item.id == "session_closed");
@@ -669,7 +680,7 @@ mod tests {
     #[test]
     fn the_weekend_reports_when_entries_reopen_and_what_still_trades() {
         let crypto = vec![Symbol::parse("BTCUSD").expect("symbol")];
-        let items = window_advisories(at(SATURDAY_NOON), None, &crypto);
+        let items = window_advisories(at(SATURDAY_NOON), None, &crypto, true);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "market_closed");
         assert_eq!(items[0].detail.as_deref(), Some("BTCUSD still trade."));
@@ -678,26 +689,36 @@ mod tests {
             items[0].until_ms,
             Some((SATURDAY_NOON + 35 * 3_600) * 1_000)
         );
-        let none = window_advisories(at(SATURDAY_NOON), None, &[]);
+        let none = window_advisories(at(SATURDAY_NOON), None, &[], true);
         assert_eq!(none[0].detail, None);
     }
 
     #[test]
     fn friday_cutoff_rollover_and_open_hours() {
         // Friday 2026-09-25 20:00 UTC: after the 19:00 cutoff.
-        let friday = window_advisories(at(1_790_366_400), None, &[]);
+        let friday = window_advisories(at(1_790_366_400), None, &[], true);
         assert_eq!(friday[0].id, "entry_cutoff");
         // Wednesday 2026-09-23 21:00 UTC: inside the rollover pause, which
         // ends at 22:15.
         let wednesday_2100 = 1_790_197_200;
-        let rollover = window_advisories(at(wednesday_2100), None, &[]);
+        let rollover = window_advisories(at(wednesday_2100), None, &[], true);
         assert_eq!(rollover[0].id, "rollover_pause");
         assert_eq!(
             rollover[0].until_ms,
             Some((wednesday_2100 + 75 * 60) * 1_000)
         );
         // Wednesday noon: nothing to report.
-        assert!(window_advisories(at(wednesday_2100 - 9 * 3_600), None, &[]).is_empty());
+        assert!(window_advisories(at(wednesday_2100 - 9 * 3_600), None, &[], true).is_empty());
+    }
+
+    #[test]
+    fn the_nightly_pause_notice_goes_away_when_the_operator_switches_it_off() {
+        // Wednesday 2026-09-23 21:00 UTC is inside the rollover blackout.
+        let wednesday_2100 = 1_790_197_200;
+        assert!(window_advisories(at(wednesday_2100), None, &[], false).is_empty());
+        // The Friday cutoff is a separate guard and still reports.
+        let friday = window_advisories(at(1_790_366_400), None, &[], false);
+        assert_eq!(friday[0].id, "entry_cutoff");
     }
 
     #[test]
@@ -934,14 +955,14 @@ mod tests {
             Symbol::parse("ETHUSD").expect("symbol"),
         ];
         // Friday 20:00 UTC with weekend symbols: the cutoff names them.
-        let friday = window_advisories(at(1_790_366_400), None, &crypto);
+        let friday = window_advisories(at(1_790_366_400), None, &crypto, true);
         assert_eq!(
             friday[0].detail.as_deref(),
             Some("Friday cutoff. Open trades are still managed. BTCUSD and ETHUSD still trade.")
         );
         // Wednesday 03:00 UTC outside an 08-17 session window.
         let session = crate::risk::SessionWindow::parse("8-17").expect("window");
-        let early = window_advisories(at(1_790_197_200 - 18 * 3_600), Some(session), &[]);
+        let early = window_advisories(at(1_790_197_200 - 18 * 3_600), Some(session), &[], true);
         assert_eq!(early[0].id, "session_closed");
         assert!(early[0].until_ms.is_some());
     }

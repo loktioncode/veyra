@@ -153,6 +153,11 @@ export type RiskPolicy = {
    * False — the default — pauses new decisions until the judge answers again.
    */
   allowTradingWithoutJev: boolean
+  /**
+   * Whether new entries pause around the daily rollover, when spreads widen.
+   * Absent from older services, which always pause.
+   */
+  rolloverPause?: boolean
   /** What happens to open positions in the final hours before Friday's close. */
   weekendPositions: WeekendPositions
   /** When the daily-loss day starts; absent from older services (UTC). */
@@ -303,7 +308,8 @@ export type MarketSessions = {
     detail: string | null
   }
   policy: {
-    rolloverBlackout: { startMinute: number; endMinute: number }
+    /** `enabled` is absent from older services, which always pause. */
+    rolloverBlackout: { startMinute: number; endMinute: number; enabled?: boolean }
     fridayEntryCutoffMinute: number
     sundayEntryOpenMinute: number
   }
@@ -490,6 +496,7 @@ export type RiskPolicyPatch = {
   calendarBlackoutMinutes?: number
   minStopAtrFraction?: number
   allowTradingWithoutJev?: boolean
+  rolloverPause?: boolean
   weekendPositions?: WeekendPositions
   dailyLossReset?: DailyLossReset
   dailyLossBasis?: DailyLossBasis

@@ -290,6 +290,10 @@
   background: var(--color-warn);
 }
 
+.rc-apply.is-ok {
+  background: var(--color-ok);
+}
+
 .rc-apply:hover:not(:disabled) {
   filter: brightness(1.08);
 }

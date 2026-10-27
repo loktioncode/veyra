@@ -711,7 +711,7 @@ describe('RiskPanel', () => {
 
     rerender(<RiskPanel />)
     expect(screen.queryByText('Gate active')).toBeNull()
-    expect(container.querySelectorAll('.skeleton').length).toBe(18)
+    expect(container.querySelectorAll('.skeleton').length).toBe(19)
   })
 
   it('renders an empty allowlist, a session window, and disarmed switches', () => {
@@ -802,6 +802,24 @@ describe('RiskPanel editing', () => {
 
     await screen.findByText(/must be an integer from 0 through 1000/)
     expect(screen.getByRole('button', { name: 'Save' })).toBeTruthy()
+  })
+
+  it('edits the nightly pause in the policy editor and shows it in the summary', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    const { rerender } = render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} />)
+    expect(screen.getByText('On')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    const pause = screen.getByRole('switch', { name: 'Nightly pause' })
+    expect(pause.getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(pause)
+    expect(pause.getAttribute('aria-checked')).toBe('false')
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByText('Gate active')
+    expect(onApply.mock.calls[0][0].rolloverPause).toBe(false)
+
+    rerender(<RiskPanel policy={{ ...status.risk_policy, rolloverPause: false }} status={status} />)
+    expect(screen.getByText('Off · trades through rollover')).toBeTruthy()
   })
 
   it('flips both switches in the draft and cancels cleanly', async () => {

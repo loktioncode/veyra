@@ -622,7 +622,7 @@ fn tool_market_window(session: &AgentSession<'_>) -> Result<Value, String> {
             } else if policy.allows_weekend(symbol) {
                 None
             } else {
-                crate::risk::window::entry_block(session.now, None)
+                crate::risk::window::entry_block_with(session.now, None, policy.rollover_pause())
             };
             json!({
                 "symbol": symbol.as_str(),
@@ -639,7 +639,7 @@ fn tool_market_window(session: &AgentSession<'_>) -> Result<Value, String> {
     } else if session_closed {
         Some(crate::risk::window::WindowBlock::SessionClosed)
     } else {
-        crate::risk::window::entry_block(session.now, None)
+        crate::risk::window::entry_block_with(session.now, None, policy.rollover_pause())
     };
     Ok(json!({
         "utc_weekday": weekday_name,

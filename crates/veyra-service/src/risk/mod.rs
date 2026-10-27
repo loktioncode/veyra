@@ -77,7 +77,7 @@ const ATR_FRACTION_RULE: &str =
     "must be a number from 0 through 2 (fraction of ATR; 0 disables the check)";
 const SESSION_RULE: &str = "must be `HH-HH` with UTC hours 0-23 and different bounds";
 const KILL_SWITCH_RULE: &str = "must be `true` or `false`";
-const WITHOUT_JEV_RULE: &str = "must be `true` or `false`";
+const TRUE_OR_FALSE_RULE: &str = "must be `true` or `false`";
 const WEEKEND_RULE: &str = "must be `agent`, `hold`, or `flatten`";
 const DAILY_RESET_RULE: &str = "must be `utc` or `broker`";
 const DAILY_BASIS_RULE: &str = "must be `equity`, `balance`, or `higher`";
@@ -143,6 +143,10 @@ pub struct RiskPolicyPatch {
     /// Whether a tick may continue when the semantic judge is unavailable.
     /// False — the default — stops trading until the judge answers again.
     pub allow_trading_without_jev: Option<bool>,
+    /// Whether new entries pause around the daily rollover (20:45-22:15 UTC),
+    /// when spreads widen. True — the default — keeps the pause; false lets
+    /// entries continue through it. The weekend guards are unaffected.
+    pub rollover_pause: Option<bool>,
     /// What happens to open positions in the final hours before Friday's
     /// close: `agent`, `hold`, or `flatten`.
     pub weekend_positions: Option<String>,
@@ -400,6 +404,7 @@ pub struct RiskPolicy {
     calendar_blackout_minutes: u64,
     min_stop_atr_fraction: f64,
     allow_trading_without_jev: bool,
+    rollover_pause: bool,
     weekend_positions: WeekendPositions,
     loss_rules: LossRules,
 }
@@ -437,6 +442,9 @@ impl RiskPolicy {
             min_stop_atr_fraction: 0.0,
             // Degraded inputs stop trading unless the owner says otherwise.
             allow_trading_without_jev: false,
+            // Spreads widen at the rollover, so the pause is on unless the
+            // operator switches it off.
+            rollover_pause: true,
             // The constructor is a baseline too: weekend positions are the
             // analyst's call unless the operator says hold or flatten.
             weekend_positions: WeekendPositions::default(),
@@ -444,6 +452,17 @@ impl RiskPolicy {
             // equity: the original guard.
             loss_rules: LossRules::default(),
         }
+    }
+
+    /// Sets whether new entries pause around the daily rollover.
+    ///
+    /// True — the default — blocks entries from 20:45 to 22:15 UTC, when
+    /// spreads widen. False is a deliberate operator override; it lifts only
+    /// that blackout and leaves the weekend guards in force.
+    #[must_use]
+    pub fn with_rollover_pause(mut self, paused: bool) -> Self {
+        self.rollover_pause = paused;
+        self
     }
 
     /// Sets whether a tick may continue after the semantic judge fails.
@@ -707,10 +726,22 @@ impl RiskPolicy {
                 Some(_) => {
                     return Err(RiskError {
                         name: "VEYRA_RISK_ALLOW_TRADING_WITHOUT_JEV",
-                        reason: WITHOUT_JEV_RULE,
+                        reason: TRUE_OR_FALSE_RULE,
                     });
                 }
             };
+
+        let rollover_pause = match trimmed(&mut source, "VEYRA_RISK_ROLLOVER_PAUSE").as_deref() {
+            None => true,
+            Some("true") => true,
+            Some("false") => false,
+            Some(_) => {
+                return Err(RiskError {
+                    name: "VEYRA_RISK_ROLLOVER_PAUSE",
+                    reason: TRUE_OR_FALSE_RULE,
+                });
+            }
+        };
 
         let weekend_positions = match trimmed(&mut source, "VEYRA_RISK_WEEKEND_POSITIONS") {
             None => WeekendPositions::default(),
@@ -763,6 +794,7 @@ impl RiskPolicy {
         .with_open_risk_cap(max_open_risk_percent)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
+        .with_rollover_pause(rollover_pause)
         .with_weekend_positions(weekend_positions)
         .with_loss_rules(LossRules {
             reset,
@@ -904,6 +936,7 @@ impl RiskPolicy {
         let allow_trading_without_jev = patch
             .allow_trading_without_jev
             .unwrap_or(self.allow_trading_without_jev);
+        let rollover_pause = patch.rollover_pause.unwrap_or(self.rollover_pause);
 
         let weekend_positions = match &patch.weekend_positions {
             None => self.weekend_positions,
@@ -952,6 +985,7 @@ impl RiskPolicy {
         .with_open_risk_cap(max_open_risk_percent)
         .with_min_stop_atr_fraction(min_stop_atr_fraction)
         .with_trading_without_jev(allow_trading_without_jev)
+        .with_rollover_pause(rollover_pause)
         .with_weekend_positions(weekend_positions)
         .with_loss_rules(loss_rules);
         policy.weekend_symbols = weekend_symbols;
@@ -1054,6 +1088,7 @@ impl RiskPolicy {
             calendar_blackout_minutes: Some(self.calendar_blackout_minutes),
             min_stop_atr_fraction: Some(self.min_stop_atr_fraction),
             allow_trading_without_jev: Some(self.allow_trading_without_jev),
+            rollover_pause: Some(self.rollover_pause),
             weekend_positions: Some(self.weekend_positions.as_str().to_owned()),
             daily_loss_reset: Some(self.loss_rules.reset.as_str().to_owned()),
             daily_loss_basis: Some(self.loss_rules.basis.as_str().to_owned()),
@@ -1068,6 +1103,12 @@ impl RiskPolicy {
     /// than quietly trading on less evidence than the design assumes.
     pub fn allow_trading_without_jev(&self) -> bool {
         self.allow_trading_without_jev
+    }
+
+    /// Whether new entries pause around the daily rollover. True is the
+    /// default; false is an operator override that lifts only that blackout.
+    pub fn rollover_pause(&self) -> bool {
+        self.rollover_pause
     }
 
     /// What happens to open positions in the final hours before Friday's
@@ -1170,6 +1211,7 @@ impl RiskPolicy {
             "calendarBlackoutMinutes": self.calendar_blackout_minutes,
             "minStopAtrFraction": self.min_stop_atr_fraction,
             "allowTradingWithoutJev": self.allow_trading_without_jev,
+            "rolloverPause": self.rollover_pause,
             "weekendPositions": self.weekend_positions.as_str(),
             "dailyLossReset": self.loss_rules.reset.as_str(),
             "dailyLossBasis": self.loss_rules.basis.as_str(),
@@ -1959,6 +2001,58 @@ mod tests {
                 .expect("patch applies")
                 .allow_trading_without_jev()
         );
+    }
+
+    #[test]
+    fn the_nightly_pause_is_on_unless_the_operator_switches_it_off() {
+        assert!(RiskPolicy::default().rollover_pause());
+        let unset = RiskPolicy::from_source(source(&[])).expect("valid settings");
+        assert!(unset.rollover_pause());
+        assert_eq!(unset.summary()["rolloverPause"], true);
+
+        let off = RiskPolicy::from_source(source(&[("VEYRA_RISK_ROLLOVER_PAUSE", "false")]))
+            .expect("valid settings");
+        assert!(!off.rollover_pause());
+        assert_eq!(off.summary()["rolloverPause"], false);
+
+        // A patch that omits the field keeps the current setting.
+        assert!(
+            !off.apply_patch(&RiskPolicyPatch::default())
+                .expect("patch applies")
+                .rollover_pause()
+        );
+        // A console edit flips it, and the persisted snapshot restores it.
+        let toggled = unset
+            .apply_patch(&RiskPolicyPatch {
+                rollover_pause: Some(false),
+                ..Default::default()
+            })
+            .expect("patch applies");
+        assert!(!toggled.rollover_pause());
+        let value = serde_json::to_value(toggled.snapshot_patch()).expect("snapshot serializes");
+        let patch: RiskPolicyPatch = serde_json::from_value(value).expect("snapshot deserializes");
+        assert!(
+            !RiskPolicy::default()
+                .apply_patch(&patch)
+                .expect("snapshot applies")
+                .rollover_pause()
+        );
+        // A snapshot saved before the switch existed leaves the pause on.
+        let legacy: RiskPolicyPatch =
+            serde_json::from_value(serde_json::json!({})).expect("an empty snapshot deserializes");
+        assert!(
+            RiskPolicy::default()
+                .apply_patch(&legacy)
+                .expect("legacy snapshot applies")
+                .rollover_pause()
+        );
+    }
+
+    #[test]
+    fn a_malformed_rollover_pause_value_fails_closed() {
+        let error = RiskPolicy::from_source(source(&[("VEYRA_RISK_ROLLOVER_PAUSE", "off")]))
+            .expect_err("only true or false parse");
+        assert_eq!(error.name, "VEYRA_RISK_ROLLOVER_PAUSE");
     }
 
     #[test]

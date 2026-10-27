@@ -362,9 +362,9 @@ export function RecentActivity({
 
 /* ---------- risk controls ---------- */
 
-type SwitchKey = 'killSwitch' | 'allowTradingWithoutJev'
+type SwitchKey = 'killSwitch' | 'allowTradingWithoutJev' | 'rolloverPause'
 
-/** Kill switch and judge bypass, each changed only through an inline confirm. */
+/** Kill switch, judge bypass and nightly pause, each changed only through an inline confirm. */
 export function RiskControls({
   policy,
   jevHealthy,
@@ -382,6 +382,8 @@ export function RiskControls({
 
   const halted = policy?.killSwitch ?? false
   const bypass = policy?.allowTradingWithoutJev ?? false
+  // Older services report no setting and always pause.
+  const pauseOn = policy?.rolloverPause ?? true
   const disabled = !policy || !onApply || pending !== undefined
 
   const request = (key: SwitchKey) => {
@@ -451,6 +453,23 @@ export function RiskControls({
           onCancel={cancel}
           onConfirm={() => void submit('allowTradingWithoutJev', !bypass)}
         />
+        <RiskSwitch
+          title="Nightly pause"
+          info="No new trades around the daily rollover (20:45–22:15 UTC), when spreads widen. The weekend cutoff stays."
+          description={
+            pauseOn ? 'No new trades around the daily rollover.' : 'Trading continues through the daily rollover.'
+          }
+          checked={pauseOn}
+          tone="ok"
+          disabled={disabled}
+          prompt={pauseOn ? 'Trade through the nightly pause?' : 'Pause entries at rollover?'}
+          confirming={confirming === 'rolloverPause'}
+          pending={pending === 'rolloverPause'}
+          error={error?.key === 'rolloverPause' ? error.message : undefined}
+          onRequest={() => request('rolloverPause')}
+          onCancel={cancel}
+          onConfirm={() => void submit('rolloverPause', !pauseOn)}
+        />
       </div>
     </Panel>
   )
@@ -477,7 +496,7 @@ function RiskSwitch({
   info?: string
   description: string
   checked: boolean
-  tone: 'bad' | 'warn'
+  tone: 'ok' | 'bad' | 'warn'
   disabled: boolean
   prompt: string
   confirming: boolean

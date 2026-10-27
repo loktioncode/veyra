@@ -675,6 +675,28 @@ describe('RiskControls', () => {
     expect(onApply).toHaveBeenCalledWith({ allowTradingWithoutJev: false })
   })
 
+  it('lets the nightly pause be switched off and back on, each after a confirm', async () => {
+    const onApply = vi.fn().mockResolvedValue(undefined)
+    const pause = () => screen.getByRole('switch', { name: 'Nightly pause' }) as HTMLButtonElement
+    const { rerender } = render(<RiskControls policy={policy} onApply={onApply} />)
+
+    // The pause is on by default, and an older service that omits it also pauses.
+    expect(pause().getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText('No new trades around the daily rollover.')).toBeTruthy()
+    fireEvent.click(pause())
+    expect(screen.getByText('Trade through the nightly pause?')).toBeTruthy()
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm' })))
+    expect(onApply).toHaveBeenCalledWith({ rolloverPause: false })
+
+    rerender(<RiskControls policy={{ ...policy, rolloverPause: false }} onApply={onApply} />)
+    expect(pause().getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByText('Trading continues through the daily rollover.')).toBeTruthy()
+    fireEvent.click(pause())
+    expect(screen.getByText('Pause entries at rollover?')).toBeTruthy()
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm' })))
+    expect(onApply).toHaveBeenLastCalledWith({ rolloverPause: true })
+  })
+
   it('reports a handler that throws instead of resolving', async () => {
     const onApply = vi.fn().mockRejectedValueOnce(new Error('network down')).mockRejectedValueOnce('refused')
     render(<RiskControls policy={policy} onApply={onApply} />)
