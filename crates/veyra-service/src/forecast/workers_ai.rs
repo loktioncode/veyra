@@ -515,4 +515,48 @@ mod tests {
             other => panic!("unexpected error {other:?}"),
         }
     }
+
+    /// Live proof against Cloudflare, ignored by default. Needs the
+    /// `VEYRA_FORECAST_PROVIDER` and `VEYRA_WORKERS_AI_*` settings in the
+    /// process environment and spends a handful of tokens. The candles are a
+    /// synthetic walk, so this proves the transport and the contract, not
+    /// forecast skill.
+    #[actix_web::test]
+    #[ignore = "requires VEYRA_WORKERS_AI_* settings and network access"]
+    async fn clairic_answers_a_range_request_within_its_bounds() {
+        let settings = ForecastSettings::from_env()
+            .expect("forecast settings must parse")
+            .expect("VEYRA_FORECAST_PROVIDER must be configured");
+        let forecaster = WorkersAiForecaster::from_settings(&settings).expect("client builds");
+        let request = RangeRequest::from_series(&series("EURUSD", 60), RangeRequest::HORIZON_BARS)
+            .expect("request");
+
+        let estimates = forecaster
+            .forecast(&request)
+            .await
+            .expect("clairic answers");
+        for field in RangeField::ALL {
+            let estimate = match field {
+                RangeField::High => estimates.high,
+                RangeField::Low => estimates.low,
+                RangeField::Close => estimates.close,
+            };
+            let (min, max) = request.bounds(field);
+            println!(
+                "{}: p10 {} median {} p90 {} (bounds {min}..{max})",
+                field.as_str(),
+                estimate.p10(),
+                estimate.median(),
+                estimate.p90()
+            );
+            assert!(estimate.p10() >= min - request.step());
+            assert!(estimate.p90() <= max + request.step());
+        }
+        println!(
+            "last close {} ATR {} tokens {}",
+            request.last_close(),
+            request.atr(),
+            estimates.input_tokens
+        );
+    }
 }
