@@ -3273,6 +3273,7 @@ async fn review_positions(
             judgements,
             forecast: None,
             tool_names: None,
+            menu: None,
         };
         return close_reviewed(
             state,
