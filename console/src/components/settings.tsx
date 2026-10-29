@@ -99,6 +99,31 @@ const SETTING_GROUPS: Array<{ title: string; prefixes: string[]; names: string[]
   },
 ]
 
+/**
+ * Model settings that do not apply to the Claude subscription. It serves one
+ * model for every tier, so the per-tier models, fallbacks and the API-provider
+ * options are hidden rather than left to be filled in with values it ignores.
+ */
+const CLAUDE_SUBSCRIPTION_HIDDEN = new Set([
+  'VEYRA_MODEL_PREFER_SUBSCRIPTION',
+  'VEYRA_MODEL_CHATGPT_MODEL',
+  'VEYRA_MODEL_FAST',
+  'VEYRA_MODEL_BALANCED',
+  'VEYRA_MODEL_REASONING',
+  'VEYRA_MODEL_FALLBACKS',
+  'VEYRA_MODEL_FAST_FALLBACKS',
+  'VEYRA_MODEL_BALANCED_FALLBACKS',
+  'VEYRA_MODEL_REASONING_FALLBACKS',
+  'VEYRA_MODEL_COMPEL_STRUCTURED',
+  'VEYRA_MODEL_BASE_URL',
+  'VEYRA_MODEL_HTTP_REFERER',
+  'VEYRA_MODEL_APP_TITLE',
+  'VEYRA_MODEL_APP_HIDDEN',
+])
+
+/** What the service uses for the Claude subscription until a custom model is set. */
+const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5-5'
+
 /** Sections the service applies immediately; the rest wait for a restart. */
 const LIVE_GROUPS = new Set(['Execution', 'Autopilot', 'Profit harvesting', 'Model'])
 
@@ -173,7 +198,7 @@ const SETTING_HELP: Record<string, string> = {
   VEYRA_MODEL_PREFER_SUBSCRIPTION:
     'Signed-in subscriptions answer every model call first, ChatGPT then Claude; the provider above takes over when they fail.',
   VEYRA_MODEL_CHATGPT_MODEL: 'Model used on the ChatGPT subscription for every tier; empty means gpt-6-luna.',
-  VEYRA_MODEL_CLAUDE_MODEL: 'Model used on the Claude subscription for every tier; empty means claude-sonnet-5-5.',
+  VEYRA_MODEL_CLAUDE_MODEL: 'Claude model for every tier; empty means Sonnet 5.5 (claude-sonnet-5-5). Set one only to use another.',
   VEYRA_MODEL_COMPEL_STRUCTURED:
     'Requires the model to answer in the structured format instead of merely offering it. Turn off for reasoning models, which refuse it.',
   VEYRA_MODEL_PROVIDER:
@@ -661,7 +686,8 @@ export function LiveSettingsPanel({
       }
     >
       {SETTING_GROUPS.map((group) => {
-        const names = group.names.filter((name) => settings[name] !== undefined)
+        const claudeOnly = group.title === 'Model' && settings.VEYRA_MODEL_PROVIDER !== undefined && settingValue('VEYRA_MODEL_PROVIDER', effective('VEYRA_MODEL_PROVIDER')) === 'claude_code'
+        const names = group.names.filter((name) => settings[name] !== undefined && !(claudeOnly && CLAUDE_SUBSCRIPTION_HIDDEN.has(name)))
         const after = group.title === 'Model' ? judge : null
         if (names.length === 0) return <Fragment key={group.title}>{after}</Fragment>
         return (
@@ -762,11 +788,13 @@ export function LiveSettingsPanel({
                         dirty={isDirty(name)}
                         aside={aside}
                         note={
-                          name === 'VEYRA_MODEL_PROVIDER'
-                            ? isDirty(name)
-                              ? 'Provider changed. Replace model IDs and clear or replace fallback IDs with ones this provider supports before Apply.'
-                              : 'Connected subscriptions use the linked ChatGPT or Claude account. API providers use developer keys.'
-                            : undefined
+                          name !== 'VEYRA_MODEL_PROVIDER'
+                            ? undefined
+                            : claudeOnly
+                              ? `Every request uses your Claude subscription with ${DEFAULT_CLAUDE_MODEL} (Sonnet 5.5) unless you set a Claude model below. Connect Claude above first.`
+                              : isDirty(name)
+                                ? 'Provider changed. Replace model IDs and clear or replace fallback IDs with ones this provider supports before Apply.'
+                                : 'Connected subscriptions use the linked ChatGPT or Claude account. API providers use developer keys.'
                         }
                         onChange={handleChange}
                       />
@@ -786,7 +814,13 @@ export function LiveSettingsPanel({
                       value={effective(name)}
                       disabled={busy}
                       dirty={isDirty(name)}
-                      placeholder={['VEYRA_MODEL_FAST', 'VEYRA_MODEL_BALANCED', 'VEYRA_MODEL_REASONING'].includes(name) ? 'Model ID from this provider' : 'Not set'}
+                      placeholder={
+                        name === 'VEYRA_MODEL_CLAUDE_MODEL'
+                          ? `${DEFAULT_CLAUDE_MODEL} (default)`
+                          : ['VEYRA_MODEL_FAST', 'VEYRA_MODEL_BALANCED', 'VEYRA_MODEL_REASONING'].includes(name)
+                            ? 'Model ID from this provider'
+                            : 'Not set'
+                      }
                       onChange={handleChange}
                       aside={aside}
                     />

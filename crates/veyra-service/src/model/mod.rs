@@ -832,10 +832,7 @@ mod tests {
         let claude = ModelRuntime::from_settings_with_app(
             settings(&[
                 ("VEYRA_MODEL_PROVIDER", "claude_code"),
-                ("VEYRA_MODEL_FAST", "claude-model"),
-                ("VEYRA_MODEL_BALANCED", "claude-model"),
-                ("VEYRA_MODEL_REASONING", "claude-model"),
-                ("VEYRA_MODEL_FALLBACKS", ""),
+                ("VEYRA_MODEL_CLAUDE_MODEL", "claude-model"),
             ]),
             &state,
         )

@@ -77,6 +77,51 @@ describe('LiveSettingsPanel', () => {
     expect(field('VEYRA_MODEL_FALLBACKS').value).toBe('z-ai/glm-5.3-flash')
   })
 
+  it('shows one Claude model, defaulting to Sonnet 5.5, once the Claude subscription is the provider', () => {
+    const claude = {
+      ...settings,
+      VEYRA_MODEL_PROVIDER: { value: 'claude_code', overridden: false },
+      VEYRA_MODEL_CLAUDE_MODEL: { value: '', overridden: false },
+      VEYRA_MODEL_PREFER_SUBSCRIPTION: { value: '', overridden: false },
+      VEYRA_MODEL_CHATGPT_MODEL: { value: '', overridden: false },
+      VEYRA_MODEL_FAST: { value: 'nvidia/nemotron-3.5-super-vl:free', overridden: true },
+      VEYRA_MODEL_BALANCED: { value: 'recursive/flint-v1.0:free', overridden: true },
+      VEYRA_MODEL_REASONING: { value: '', overridden: false },
+      VEYRA_MODEL_BASE_URL: { value: '', overridden: false },
+      VEYRA_MODEL_MAX_CALLS_PER_DAY: { value: '', overridden: false },
+    }
+    render(<LiveSettingsPanel settings={claude} onApply={vi.fn()} />)
+    for (const hidden of [
+      'VEYRA_MODEL_FAST',
+      'VEYRA_MODEL_BALANCED',
+      'VEYRA_MODEL_REASONING',
+      'VEYRA_MODEL_FALLBACKS',
+      'VEYRA_MODEL_PREFER_SUBSCRIPTION',
+      'VEYRA_MODEL_CHATGPT_MODEL',
+      'VEYRA_MODEL_BASE_URL',
+    ]) {
+      expect(field(hidden), hidden).toBeNull()
+    }
+    expect(field('VEYRA_MODEL_CLAUDE_MODEL').placeholder).toBe('claude-sonnet-5-5 (default)')
+    expect(field('VEYRA_MODEL_CLAUDE_MODEL').value).toBe('')
+    expect(field('VEYRA_MODEL_MAX_CALLS_PER_DAY')).toBeTruthy()
+    expect(screen.getByText(/Every request uses your Claude subscription with claude-sonnet-5-5 \(Sonnet 5.5\)/)).toBeTruthy()
+    // No credential box: the subscription is the credential.
+    expect(screen.queryByText('API credential')).toBeNull()
+  })
+
+  it('brings the tier models back as soon as another provider is chosen', () => {
+    const claude = {
+      ...settings,
+      VEYRA_MODEL_PROVIDER: { value: 'claude_code', overridden: false },
+      VEYRA_MODEL_FAST: { value: 'x/y', overridden: false },
+    }
+    render(<LiveSettingsPanel settings={claude} onApply={vi.fn()} />)
+    expect(field('VEYRA_MODEL_FAST')).toBeNull()
+    fireEvent.change(field('VEYRA_MODEL_PROVIDER'), { target: { value: 'openrouter' } })
+    expect(field('VEYRA_MODEL_FAST').value).toBe('x/y')
+  })
+
   it('requires applying a provider draft before saving an API key for it', () => {
     render(<LiveSettingsPanel settings={settings} onApply={vi.fn()} secretStore />)
     expect(screen.getByRole('button', { name: 'Save key' })).toBeTruthy()

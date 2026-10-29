@@ -9,6 +9,12 @@
 //! integration nor require a key; they are still validated whenever they are
 //! set.
 //!
+//! With `VEYRA_MODEL_PROVIDER=claude_code` the Claude subscription serves one
+//! model, `VEYRA_MODEL_CLAUDE_MODEL` (default [`DEFAULT_CLAUDE_MODEL`]), for
+//! every tier. The tier and fallback settings then do not apply: they are not
+//! required, and a value left over from another provider is ignored rather
+//! than sent to Claude.
+//!
 //! Tier models must accept a *forced tool call*: the structured path enforces
 //! the response schema through `tool_choice`, and reasoning modes that reject
 //! it fail with a provider error (for example DeepSeek "thinking mode does not
@@ -271,43 +277,53 @@ impl ModelSettings {
 
         let base_url = parse_base_url(provider, &base_raw)?;
 
-        let tier = |name: &'static str, value: String| {
-            if value.is_empty() {
-                Err(ConfigError::MissingEnvironmentVariable { name })
-            } else {
-                validate_model_identifier(provider, name, &value)
-            }
-        };
+        let tiers = if provider == ModelProvider::ClaudeCode {
+            // One subscription, one model: no per-tier choice, no fallbacks.
+            TierModels::new(
+                claude_model.clone(),
+                claude_model.clone(),
+                claude_model.clone(),
+            )
+        } else {
+            let tier = |name: &'static str, value: String| {
+                if value.is_empty() {
+                    Err(ConfigError::MissingEnvironmentVariable { name })
+                } else {
+                    validate_model_identifier(provider, name, &value)
+                }
+            };
 
-        // A shared list applies to every tier; a tier-specific list replaces it
-        // for that tier rather than extending it, so one narrow override never
-        // has to restate the shared chain.
-        let shared_fallbacks = parse_fallbacks(provider, "VEYRA_MODEL_FALLBACKS", &fallbacks_raw)?;
-        let per_tier = |name: &'static str, raw: &str| -> Result<Vec<String>, ConfigError> {
-            if raw.is_empty() {
-                Ok(shared_fallbacks.clone())
-            } else {
-                parse_fallbacks(provider, name, raw)
-            }
-        };
+            // A shared list applies to every tier; a tier-specific list replaces it
+            // for that tier rather than extending it, so one narrow override never
+            // has to restate the shared chain.
+            let shared_fallbacks =
+                parse_fallbacks(provider, "VEYRA_MODEL_FALLBACKS", &fallbacks_raw)?;
+            let per_tier = |name: &'static str, raw: &str| -> Result<Vec<String>, ConfigError> {
+                if raw.is_empty() {
+                    Ok(shared_fallbacks.clone())
+                } else {
+                    parse_fallbacks(provider, name, raw)
+                }
+            };
 
-        let tiers = TierModels::new(
-            tier("VEYRA_MODEL_FAST", fast_raw)?,
-            tier("VEYRA_MODEL_BALANCED", balanced_raw)?,
-            tier("VEYRA_MODEL_REASONING", reasoning_raw)?,
-        )
-        .with_fallbacks(
-            ModelTier::Fast,
-            per_tier("VEYRA_MODEL_FAST_FALLBACKS", &fast_fallbacks_raw)?,
-        )
-        .with_fallbacks(
-            ModelTier::Balanced,
-            per_tier("VEYRA_MODEL_BALANCED_FALLBACKS", &balanced_fallbacks_raw)?,
-        )
-        .with_fallbacks(
-            ModelTier::Reasoning,
-            per_tier("VEYRA_MODEL_REASONING_FALLBACKS", &reasoning_fallbacks_raw)?,
-        );
+            TierModels::new(
+                tier("VEYRA_MODEL_FAST", fast_raw)?,
+                tier("VEYRA_MODEL_BALANCED", balanced_raw)?,
+                tier("VEYRA_MODEL_REASONING", reasoning_raw)?,
+            )
+            .with_fallbacks(
+                ModelTier::Fast,
+                per_tier("VEYRA_MODEL_FAST_FALLBACKS", &fast_fallbacks_raw)?,
+            )
+            .with_fallbacks(
+                ModelTier::Balanced,
+                per_tier("VEYRA_MODEL_BALANCED_FALLBACKS", &balanced_fallbacks_raw)?,
+            )
+            .with_fallbacks(
+                ModelTier::Reasoning,
+                per_tier("VEYRA_MODEL_REASONING_FALLBACKS", &reasoning_fallbacks_raw)?,
+            )
+        };
 
         // Zero means unlimited; the cap bounds accidents, not normal use.
         let cap = |name: &'static str, raw: &str| -> Result<u32, ConfigError> {
@@ -1163,6 +1179,56 @@ mod tests {
         ] {
             assert!(!base.same_route(&routed), "{routed:?}");
         }
+    }
+
+    #[test]
+    fn the_claude_subscription_serves_one_model_for_every_tier() {
+        let claude = |overrides: &[(&'static str, &str)]| {
+            let mut pairs = vec![("VEYRA_MODEL_PROVIDER", "claude_code")];
+            pairs.extend_from_slice(overrides);
+            ModelSettings::from_source(source(&pairs))
+                .expect("claude settings parse")
+                .expect("configured")
+        };
+        let tiers = [ModelTier::Fast, ModelTier::Balanced, ModelTier::Reasoning];
+
+        // No tier or fallback setting is needed; Sonnet 5.5 answers every tier.
+        let defaults = claude(&[]);
+        assert_eq!(defaults.claude_model(), "claude-sonnet-5-5");
+        for tier in tiers {
+            assert_eq!(defaults.tiers().chain(tier), ["claude-sonnet-5-5"]);
+        }
+        assert_eq!(defaults.api_key(), None);
+
+        // A custom Claude model replaces it everywhere.
+        let custom = claude(&[("VEYRA_MODEL_CLAUDE_MODEL", "claude-opus-5-5")]);
+        for tier in tiers {
+            assert_eq!(custom.tiers().chain(tier), ["claude-opus-5-5"]);
+        }
+
+        // Values left over from another provider are not sent to Claude.
+        let stale = claude(&[
+            ("VEYRA_MODEL_FAST", "nvidia/nemotron-3.5-super-vl:free"),
+            ("VEYRA_MODEL_BALANCED", "recursive/flint-v1.0:free"),
+            ("VEYRA_MODEL_FALLBACKS", "z-ai/glm-5.3-flash"),
+        ]);
+        for tier in tiers {
+            assert_eq!(stale.tiers().chain(tier), ["claude-sonnet-5-5"]);
+        }
+        assert!(stale.same_route(&defaults));
+
+        // Other providers still require their tiers.
+        let error = ModelSettings::from_source(source(&[
+            ("VEYRA_MODEL_PROVIDER", "openrouter"),
+            ("VEYRA_MODEL_API_KEY", KEY),
+        ]))
+        .expect_err("openrouter still needs tier models");
+        assert!(matches!(
+            error,
+            ConfigError::MissingEnvironmentVariable {
+                name: "VEYRA_MODEL_FAST"
+            }
+        ));
     }
 
     #[test]
