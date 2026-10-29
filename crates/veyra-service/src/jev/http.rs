@@ -15,6 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use super::contract::{JevRequest, JevResponse, parse_response_body};
+use super::openai::provider_detail;
 use super::settings::{JevApiKey, JevSettings};
 use super::{JevError, JevProvider, SemanticJudge};
 
@@ -149,7 +150,15 @@ impl SemanticJudge for HttpJev {
 
         match status {
             200..=299 => {}
-            401 | 403 => return Err(JevError::Unauthorized),
+            // The provider's own words travel with the refusal: OpenRouter
+            // answers 403 for a spent key limit as well as for a bad key, and
+            // only the message tells those apart.
+            401 | 403 => {
+                return Err(JevError::Denied {
+                    status,
+                    detail: provider_detail(&bytes),
+                });
+            }
             422 => {
                 return Err(JevError::Rejected {
                     detail: error_detail(&bytes),
@@ -389,9 +398,29 @@ mod tests {
         let judge = HttpJev::from_settings(&settings(&unauthorized.base_url)).expect("client");
         assert!(matches!(
             judge.judge(request()).await.expect_err("401"),
-            JevError::Unauthorized
+            JevError::Denied { status: 401, .. }
         ));
         unauthorized.shutdown().await;
+
+        // A spent key limit is a 403, and the reason must reach the operator
+        // instead of reading as a bad credential.
+        let capped = spawn((
+            403,
+            json!({"error": {"message": "Key limit exceeded (weekly limit). Manage it using https://openrouter.ai/settings/keys", "code": 403}}).to_string(),
+        ))
+        .await;
+        let judge = HttpJev::from_settings(&settings(&capped.base_url)).expect("client");
+        match judge.judge(request()).await.expect_err("403") {
+            JevError::Denied { status, detail } => {
+                assert_eq!(status, 403);
+                assert!(
+                    detail.starts_with("Key limit exceeded (weekly limit)"),
+                    "{detail}"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        capped.shutdown().await;
 
         let rejected = spawn((
             422,

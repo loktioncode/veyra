@@ -264,9 +264,11 @@ impl SemanticJudge for OpenAiJudge {
     }
 }
 
-/// OpenAI's `error.message` when the body carries one, else a bounded body
-/// preview; anything shaped like an API key is scrubbed either way.
-fn provider_detail(bytes: &[u8]) -> String {
+/// A provider's `error.message` when the body carries one, else a bounded body
+/// preview; anything shaped like an API key is scrubbed either way. Shared by
+/// every judge so a refusal says why (a spent key limit, a disabled preview)
+/// instead of only that it happened.
+pub(crate) fn provider_detail(bytes: &[u8]) -> String {
     let message = serde_json::from_slice::<Value>(bytes)
         .ok()
         .and_then(|body| {
