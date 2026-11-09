@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   config: vi.fn(),
   trades: vi.fn(),
   updatePolicy: vi.fn(),
+  resetPeak: vi.fn(),
   updateConfig: vi.fn(),
   notifications: vi.fn(),
   updateNotifications: vi.fn(),
@@ -55,6 +56,7 @@ vi.mock('../lib/api', async (importOriginal) => {
     balanceHistory: mocks.balanceHistory,
     trades: mocks.trades,
     updatePolicy: mocks.updatePolicy,
+    resetPeak: mocks.resetPeak,
     updateConfig: mocks.updateConfig,
     notifications: mocks.notifications,
     advisories: mocks.advisories,
@@ -252,6 +254,7 @@ beforeEach(() => {
     openai: { key: { set: true, hint: 'WXYZ' }, model: 'gpt-6-luna', test: null, fallbacks: 2 },
   })
   mocks.updatePolicy.mockReset()
+  mocks.resetPeak.mockReset()
   mocks.updateConfig.mockReset()
   mocks.updateNotifications.mockReset()
 })
@@ -434,6 +437,32 @@ describe('Dashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
     await screen.findByText('Applied')
     expect(mocks.updateConfig).toHaveBeenCalledWith({ VEYRA_TRADING_ENABLED: 'false' })
+  })
+
+  it('resets the peak from the settings tab after a confirming click', async () => {
+    mocks.resetPeak.mockResolvedValue({ discardedPeakEquity: 49.7, peakEquity: 33.6 })
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+
+    openTab('Settings')
+    await screen.findByRole('heading', { name: 'Peak drawdown' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
+    expect(mocks.resetPeak).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }))
+    await screen.findByText(/Peak reset to the current equity/)
+    expect(mocks.resetPeak).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows why the service refused a peak reset', async () => {
+    mocks.resetPeak.mockRejectedValue(new Error('No fresh account reading from the terminal.'))
+    render(<Dashboard />)
+    await screen.findByText('Equity')
+
+    openTab('Settings')
+    await screen.findByRole('heading', { name: 'Peak drawdown' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' }))
+    expect((await screen.findByRole('alert')).textContent).toContain('No fresh account reading')
   })
 
   it('surfaces live-settings rejections from the route callback', async () => {

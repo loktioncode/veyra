@@ -971,22 +971,16 @@ export function RiskPanel({
   policy,
   status,
   onApply,
-  onResetPeak,
 }: {
   policy?: RiskPolicy
   status?: Status
   /** Applies a patch; resolves to an error message or undefined on success. */
   onApply?: (patch: RiskPolicyPatch) => Promise<string | undefined>
-  /** Restarts the highest-equity baseline at the current equity; resolves to an error message or undefined on success. */
-  onResetPeak?: () => Promise<string | undefined>
 }) {
   // An open draft is the editor; there is no separate editing flag to drift.
   const [draft, setDraft] = useState<PolicyDraft>()
   const [error, setError] = useState<string>()
   const [saving, setSaving] = useState(false)
-  // Resetting the peak loosens the brake, so it takes a second, explicit click.
-  const [confirmingReset, setConfirmingReset] = useState(false)
-  const [resetting, setResetting] = useState(false)
 
   const startEditing = (current: RiskPolicy) => {
     setDraft(draftFromPolicy(current))
@@ -1021,15 +1015,6 @@ export function RiskPanel({
     } else {
       setDraft(undefined)
     }
-  }
-
-  const resetPeak = async (reset: () => Promise<string | undefined>) => {
-    setResetting(true)
-    setError(undefined)
-    const failure = await reset()
-    setResetting(false)
-    setConfirmingReset(false)
-    if (failure) setError(failure)
   }
 
   if (draft && onApply) {
@@ -1147,8 +1132,6 @@ export function RiskPanel({
   const known = policy !== undefined
   const view = (text: (current: RiskPolicy) => string) => (policy ? text(policy) : undefined)
   const offOr = (active: boolean, text: string) => (active ? text : 'Off')
-  // Only a peak brake measured from the highest equity has a peak to reset.
-  const canResetPeak = known && onResetPeak !== undefined && policy.maxPeakDrawdownPercent > 0 && !((policy.drawdownReference ?? 0) > 0)
   return (
     <Panel
       title="Risk policy"
@@ -1157,34 +1140,11 @@ export function RiskPanel({
         known ? (
           <>
             {policy.killSwitch ? <State tone="bad">Kill switch on</State> : <State tone="ok">Gate active</State>}
-            {canResetPeak && confirmingReset ? (
-              <>
-                <Button onClick={() => void resetPeak(onResetPeak)} disabled={resetting}>
-                  {resetting ? 'Resetting…' : 'Confirm reset'}
-                </Button>
-                <Button onClick={() => setConfirmingReset(false)} disabled={resetting}>
-                  Cancel
-                </Button>
-              </>
-            ) : canResetPeak ? (
-              <Button onClick={() => setConfirmingReset(true)}>Reset peak</Button>
-            ) : null}
             {onApply ? <Button onClick={() => startEditing(policy)}>Edit</Button> : null}
           </>
         ) : null
       }
     >
-      {error ? (
-        <p className="tab-error" role="alert">
-          {error}
-        </p>
-      ) : null}
-      {confirmingReset ? (
-        <p className="tab-group-note">
-          Restarts the peak at the account's current equity, so new trades resume now and the peak brake counts losses from here. The
-          losses so far are accepted, not undone. Recorded in the audit trail.
-        </p>
-      ) : null}
       <Fields columns={3}>
         <Field
           label="Symbols"
@@ -1264,6 +1224,92 @@ export function RiskPanel({
           tone={status?.ea_live_orders ? 'tone-ok' : undefined}
         />
       </Fields>
+    </Panel>
+  )
+}
+
+/**
+ * Settings-tab control for a peak-drawdown pause the operator accepts: restarts
+ * the highest-equity baseline at the account's current equity, so new trades
+ * resume and the peak brake counts losses from here. It loosens a breaker, so
+ * it takes a second, explicit click; the service audits every accepted reset.
+ * Offered only when the peak brake is on and measures from the highest equity
+ * (a fixed reference has no stored peak to reset).
+ */
+export function PeakResetPanel({
+  policy,
+  onResetPeak,
+}: {
+  policy?: RiskPolicy
+  /** Restarts the peak at the current equity; resolves to an error message or undefined on success. */
+  onResetPeak?: () => Promise<string | undefined>
+}) {
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const [done, setDone] = useState(false)
+  if (!policy || !onResetPeak) return null
+
+  const braking = policy.maxPeakDrawdownPercent > 0
+  const fixed = (policy.drawdownReference ?? 0) > 0
+  const available = braking && !fixed
+
+  const reset = async (run: () => Promise<string | undefined>) => {
+    setBusy(true)
+    setError(undefined)
+    setDone(false)
+    const failure = await run()
+    setBusy(false)
+    setConfirming(false)
+    if (failure) setError(failure)
+    else setDone(true)
+  }
+
+  return (
+    <Panel
+      title="Peak drawdown"
+      className="tab-panel"
+      actions={
+        available && confirming ? (
+          <>
+            <Button onClick={() => void reset(onResetPeak)} disabled={busy}>
+              {busy ? 'Resetting…' : 'Confirm reset'}
+            </Button>
+            <Button onClick={() => setConfirming(false)} disabled={busy}>
+              Cancel
+            </Button>
+          </>
+        ) : available ? (
+          <Button
+            onClick={() => {
+              setDone(false)
+              setConfirming(true)
+            }}
+          >
+            Reset peak
+          </Button>
+        ) : null
+      }
+    >
+      {error ? (
+        <p className="tab-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      {done ? <p className="tab-group-note">Peak reset to the current equity. New trades can resume.</p> : null}
+      <Fields>
+        <Field label="Peak brake" value={braking ? `${policy.maxPeakDrawdownPercent}% below the peak` : 'Off'} />
+        <Field label="Measured from" value={fixed ? `Fixed reference ${policy.drawdownReference}` : 'Highest equity reached'} />
+      </Fields>
+      <p className="tab-group-note">
+        {confirming
+          ? "Restarts the peak at the account's current equity, so new trades resume now and the brake counts losses from here. The losses so far are accepted, not undone. Recorded in the audit trail."
+          : !braking
+            ? 'The peak brake is off, so there is no pause to end.'
+            : fixed
+              ? 'A fixed reference is set, so there is no stored peak to reset. Change or clear the reference in the risk policy instead.'
+              : 'Ends a "New trades paused" notice that is measured from the account\'s highest equity.'}
+      </p>
     </Panel>
   )
 }

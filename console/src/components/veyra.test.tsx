@@ -33,6 +33,7 @@ import {
   MetricsPanel,
   ModelRoutePanel,
   Pager,
+  PeakResetPanel,
   RiskPanel,
   SessionPanel,
   TracePanel,
@@ -736,11 +737,10 @@ describe('RiskPanel', () => {
   })
 })
 
-describe('RiskPanel peak reset', () => {
-  it('needs a second click, then resets and leaves the policy untouched', async () => {
+describe('PeakResetPanel', () => {
+  it('needs a second click, then resets without touching the policy', async () => {
     const onResetPeak = vi.fn().mockResolvedValue(undefined)
-    const onApply = vi.fn()
-    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} onResetPeak={onResetPeak} />)
+    render(<PeakResetPanel policy={status.risk_policy} onResetPeak={onResetPeak} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
     expect(onResetPeak).not.toHaveBeenCalled()
@@ -748,39 +748,45 @@ describe('RiskPanel peak reset', () => {
 
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' })))
     expect(onResetPeak).toHaveBeenCalledTimes(1)
-    expect(onApply).not.toHaveBeenCalled()
+    expect(screen.getByText(/Peak reset to the current equity/)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Reset peak' })).toBeTruthy()
   })
 
   it('cancels without resetting', () => {
     const onResetPeak = vi.fn()
-    render(<RiskPanel policy={status.risk_policy} status={status} onResetPeak={onResetPeak} />)
+    render(<PeakResetPanel policy={status.risk_policy} onResetPeak={onResetPeak} />)
     fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(onResetPeak).not.toHaveBeenCalled()
     expect(screen.getByRole('button', { name: 'Reset peak' })).toBeTruthy()
   })
 
-  it('shows the reason when the service refuses', async () => {
+  it('shows the reason when the service refuses and does not claim success', async () => {
     const onResetPeak = vi.fn().mockResolvedValue('No fresh account reading from the terminal.')
-    render(<RiskPanel policy={status.risk_policy} status={status} onResetPeak={onResetPeak} />)
+    render(<PeakResetPanel policy={status.risk_policy} onResetPeak={onResetPeak} />)
     fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
     await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' })))
     expect(screen.getByRole('alert').textContent).toContain('No fresh account reading')
+    expect(screen.queryByText(/Peak reset to the current equity/)).toBeNull()
   })
 
-  it('is not offered when the peak brake is off or measures from a fixed reference', () => {
+  it('explains instead of offering a reset when the brake is off or uses a fixed reference', () => {
     const onResetPeak = vi.fn()
     const { rerender } = render(
-      <RiskPanel policy={{ ...status.risk_policy, maxPeakDrawdownPercent: 0 }} status={status} onResetPeak={onResetPeak} />,
+      <PeakResetPanel policy={{ ...status.risk_policy, maxPeakDrawdownPercent: 0 }} onResetPeak={onResetPeak} />,
     )
     expect(screen.queryByRole('button', { name: 'Reset peak' })).toBeNull()
-    rerender(
-      <RiskPanel policy={{ ...status.risk_policy, drawdownReference: 10000 }} status={status} onResetPeak={onResetPeak} />,
-    )
+    expect(screen.getByText(/peak brake is off/)).toBeTruthy()
+    rerender(<PeakResetPanel policy={{ ...status.risk_policy, drawdownReference: 10000 }} onResetPeak={onResetPeak} />)
     expect(screen.queryByRole('button', { name: 'Reset peak' })).toBeNull()
-    rerender(<RiskPanel policy={status.risk_policy} status={status} />)
-    expect(screen.queryByRole('button', { name: 'Reset peak' })).toBeNull()
+    expect(screen.getByText(/fixed reference is set/)).toBeTruthy()
+  })
+
+  it('renders nothing without a policy or a reset handler', () => {
+    const { container, rerender } = render(<PeakResetPanel onResetPeak={vi.fn()} />)
+    expect(container.textContent).toBe('')
+    rerender(<PeakResetPanel policy={status.risk_policy} />)
+    expect(container.textContent).toBe('')
   })
 })
 

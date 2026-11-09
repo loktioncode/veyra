@@ -26,6 +26,7 @@ import {
   LogsPanel,
   MetricsPanel,
   ModelRoutePanel,
+  PeakResetPanel,
   RiskPanel,
   SessionPanel,
   TracePanel,
@@ -319,7 +320,7 @@ export function Dashboard() {
 
           {tab === 'risk' ? (
             <div className="tab-stack">
-              <RiskPanel policy={status?.risk_policy} status={status} onApply={applyPatch} onResetPeak={resetPeak} />
+              <RiskPanel policy={status?.risk_policy} status={status} onApply={applyPatch} />
               <div className="tab-grid">
                 <AccountPanel account={account} error={accountError} />
                 <SessionPanel sessions={sessions} account={account} />
@@ -360,6 +361,7 @@ export function Dashboard() {
                 onApply={applyConfig}
                 onRefresh={() => void refetchConfig()}
               />
+              <PeakResetPanel policy={status?.risk_policy} onResetPeak={resetPeak} />
             </div>
           ) : null}
 
