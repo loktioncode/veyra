@@ -1051,6 +1051,9 @@ export const api = {
   /** Durable trail, newest first. Survives restarts, unlike the log ring. */
   audit: (limit = 200) => get<AuditPage>(`/audit?limit=${limit}`),
   updatePolicy: (patch: RiskPolicyPatch) => post<RiskPolicy>('/risk/policy', patch),
+  /** Restarts the highest-equity baseline at the current equity, ending a peak-drawdown pause. */
+  resetPeak: () =>
+    post<{ discardedPeakEquity: number | null; peakEquity: number }>('/risk/peak/reset', {}),
   /** The live risk policy, including the instrument allowlist. */
   riskPolicy: () => get<RiskPolicy>('/risk/policy'),
   /** Every instrument the broker offers, grouped by market; served from memory. */

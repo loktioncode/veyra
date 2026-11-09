@@ -45,6 +45,7 @@ pub fn create_app(
         .service(crate::control::command_list)
         .service(crate::control::risk_policy)
         .service(crate::control::update_risk_policy)
+        .service(crate::control::reset_peak)
         .service(crate::control::runtime_config)
         .service(crate::control::update_runtime_config)
         .service(crate::control::set_model_credential)

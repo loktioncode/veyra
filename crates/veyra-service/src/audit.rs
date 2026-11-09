@@ -91,11 +91,14 @@ pub enum AuditKind {
     /// The terminal moved to a different trading account and the drawdown
     /// baselines were reset (old and new account number and server).
     AccountChanged,
+    /// An operator reset the highest-equity baseline to the current equity,
+    /// which ends a peak-drawdown pause (discarded peak and new equity).
+    PeakReset,
 }
 
 impl AuditKind {
     /// Every category, in declaration order.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::CommandQueued,
         Self::CommandCompleted,
         Self::CommandFailed,
@@ -112,6 +115,7 @@ impl AuditKind {
         Self::RuntimeConfigUpdated,
         Self::TerminalChanged,
         Self::AccountChanged,
+        Self::PeakReset,
     ];
 
     /// Parses a stable wire name; unknown names are rejected.
@@ -138,6 +142,7 @@ impl AuditKind {
             Self::RuntimeConfigUpdated => "runtime_config_updated",
             Self::TerminalChanged => "terminal_changed",
             Self::AccountChanged => "account_changed",
+            Self::PeakReset => "peak_reset",
         }
     }
 }

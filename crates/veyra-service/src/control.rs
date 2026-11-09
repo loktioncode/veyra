@@ -164,6 +164,34 @@ pub async fn update_risk_policy(
     }
 }
 
+/// Resets the highest-equity baseline to the account's current equity.
+///
+/// The operator's way out of a peak-drawdown pause they accept: new trades
+/// resume at once, measured from where the account is now. It refuses without
+/// a fresh account reading and while a fixed peak reference is set, and an
+/// accepted reset is saved and written to the audit trail with the discarded
+/// peak. The daily-loss breaker is unaffected.
+#[post("/risk/peak/reset")]
+pub async fn reset_peak(state: Data<AppState>) -> HttpResponse {
+    use crate::risk::guard::PeakResetError;
+    match crate::risk::guard::reset_peak(state.as_ref()).await {
+        Ok(reset) => HttpResponse::Ok().json(json!({
+            "discardedPeakEquity": reset.discarded_peak_equity,
+            "peakEquity": reset.peak_equity
+        })),
+        Err(error) => {
+            tracing::warn!(reason = error.code(), "peak reset refused");
+            let body = json!({ "error": error.code(), "reason": error.reason() });
+            match error {
+                PeakResetError::FixedReference => HttpResponse::Conflict().json(body),
+                PeakResetError::AccountUnavailable | PeakResetError::UnusableEquity => {
+                    HttpResponse::ServiceUnavailable().json(body)
+                }
+            }
+        }
+    }
+}
+
 /// Returns every live setting with its effective value.
 ///
 /// `overridden` marks the ones an operator has moved away from the deployed

@@ -41,6 +41,10 @@ const MAX_PENDING_SWITCHES: usize = 8;
 /// How often [`watch`] reads the latest account and reports switches.
 const WATCH_PERIOD: Duration = Duration::from_secs(5);
 
+/// The oldest account reading a peak reset will take its equity from; the
+/// terminal reports far more often, so an older one means the link is down.
+const MAX_RESET_ACCOUNT_AGE: Duration = Duration::from_secs(60);
+
 /// Drawdowns at one observation, in percent (0 = at or above the baseline).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Drawdowns {
@@ -154,6 +158,52 @@ pub struct AccountSwitch {
     pub new_equity: f64,
 }
 
+/// Why a peak reset was refused. Nothing changes in any of these cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeakResetError {
+    /// The equity to reset to was not a positive finite number.
+    UnusableEquity,
+    /// No fresh account reading is available, so the current equity is
+    /// unknown.
+    AccountUnavailable,
+    /// A fixed peak reference is set, so the stored peak is not what the
+    /// breaker measures from and resetting it would change nothing.
+    FixedReference,
+}
+
+impl PeakResetError {
+    /// Stable machine-readable code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::UnusableEquity => "unusable_equity",
+            Self::AccountUnavailable => "account_unavailable",
+            Self::FixedReference => "fixed_reference",
+        }
+    }
+
+    /// Plain-words explanation for the operator.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnusableEquity => "The account reported an equity that cannot be used.",
+            Self::AccountUnavailable => {
+                "No fresh account reading from the terminal; the current equity is unknown."
+            }
+            Self::FixedReference => {
+                "A Peak reference balance is set, so the breaker does not measure from the highest equity. Change or clear the reference instead."
+            }
+        }
+    }
+}
+
+/// The outcome of an accepted peak reset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeakReset {
+    /// The highest equity the guard had recorded, if any.
+    pub discarded_peak_equity: Option<f64>,
+    /// The equity the peak now starts from.
+    pub peak_equity: f64,
+}
+
 #[derive(Debug, Default, Clone)]
 struct GuardState {
     identity: Option<AccountIdentity>,
@@ -261,6 +311,27 @@ impl EquityGuard {
         state.day_start_balance = day_start_balance;
         state.peak_equity = peak_equity;
         Ok(())
+    }
+
+    /// Moves the highest-equity baseline to `equity`, ending a peak-drawdown
+    /// pause measured from the old peak, and returns the peak it replaced.
+    ///
+    /// The day baseline is left alone, so the daily-loss breaker keeps its
+    /// budget. This is an operator decision to accept the loss so far; the
+    /// caller records it in the audit trail ([`reset_peak`]).
+    ///
+    /// # Errors
+    /// [`PeakResetError::UnusableEquity`] when `equity` is not a positive
+    /// finite number; nothing changes.
+    pub fn reset_peak(&self, equity: f64) -> Result<Option<f64>, PeakResetError> {
+        if !equity.is_finite() || equity <= 0.0 {
+            return Err(PeakResetError::UnusableEquity);
+        }
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Ok(state.peak_equity.replace(equity))
     }
 
     /// Drains the account switches not yet reported, oldest first, so the
@@ -435,6 +506,68 @@ pub fn observe_account(
         },
         rules,
     )
+}
+
+/// Resets the highest-equity baseline to the account's current equity, the
+/// operator's way out of a peak-drawdown pause that they accept.
+///
+/// Refuses when there is no recent reading (a stale equity would set a wrong
+/// peak) or when a fixed peak reference is set (the stored peak is not what
+/// the breaker measures). The reading is observed first, so an account change
+/// is handled as a switch rather than a reset. An accepted reset is saved so a
+/// restart cannot bring the old peak back, and is written to the audit trail
+/// with the discarded peak. It loosens a breaker by an explicit operator
+/// decision; it never runs on its own.
+///
+/// # Errors
+/// A [`PeakResetError`]; nothing is changed or recorded.
+pub async fn reset_peak(state: &crate::AppState) -> Result<PeakReset, PeakResetError> {
+    let broker = state.broker().ok_or(PeakResetError::AccountUnavailable)?;
+    let link = broker.link();
+    let account = link
+        .last_account()
+        .ok_or(PeakResetError::AccountUnavailable)?;
+    if link
+        .last_account_age(SystemTime::now())
+        .is_none_or(|age| age > MAX_RESET_ACCOUNT_AGE)
+    {
+        return Err(PeakResetError::AccountUnavailable);
+    }
+    if state.risk().policy().loss_rules().drawdown_reference > 0.0 {
+        return Err(PeakResetError::FixedReference);
+    }
+    observe_account(state, &account, SystemTime::now());
+    let discarded_peak_equity = state.equity_guard().reset_peak(account.equity)?;
+    let snapshot = state.equity_guard().state_snapshot();
+    tracing::warn!(
+        discarded_peak_equity = ?discarded_peak_equity,
+        peak_equity = account.equity,
+        "peak equity reset by operator"
+    );
+    if let Some(audit) = state.audit() {
+        audit
+            .try_record(crate::audit::AuditEvent::new(
+                crate::audit::AuditKind::PeakReset,
+                serde_json::json!({
+                    "origin": "control_surface",
+                    "accountLogin": snapshot["accountLogin"],
+                    "accountServer": snapshot["accountServer"],
+                    "discardedPeakEquity": discarded_peak_equity,
+                    "peakEquity": account.equity,
+                }),
+            ))
+            .await;
+    }
+    let runtime = state.runtime_state();
+    if runtime.enabled() {
+        runtime
+            .save(crate::state::StateKey::EquityBaselines, &snapshot)
+            .await;
+    }
+    Ok(PeakReset {
+        discarded_peak_equity,
+        peak_equity: account.equity,
+    })
 }
 
 /// Keeps the drawdown baselines honest across account changes for the life
@@ -870,6 +1003,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resetting_the_peak_restarts_it_at_the_current_equity() {
+        let guard = EquityGuard::new();
+        guard.observe(100.0, day(0));
+        let low = guard.observe(60.0, day(0));
+        assert!((low.peak_percent - 40.0).abs() < 1e-9);
+        let before = guard.state_snapshot();
+
+        assert_eq!(guard.reset_peak(60.0), Ok(Some(100.0)));
+        let after = guard.observe(60.0, day(0));
+        assert_eq!(after.peak_percent, 0.0, "the pause ends");
+        assert_eq!(guard.state_snapshot()["peakEquity"], 60.0);
+        assert_eq!(
+            guard.state_snapshot()["dayStartEquity"],
+            before["dayStartEquity"],
+            "the daily baseline is untouched"
+        );
+        // The new peak still behaves like one.
+        let lower = guard.observe(54.0, day(0));
+        assert!((lower.peak_percent - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resetting_the_peak_refuses_unusable_equity_without_changing_anything() {
+        let guard = EquityGuard::new();
+        guard.observe(100.0, day(0));
+        for bad in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(guard.reset_peak(bad), Err(PeakResetError::UnusableEquity));
+        }
+        assert_eq!(guard.state_snapshot()["peakEquity"], 100.0);
+    }
+
+    #[test]
+    fn resetting_an_unset_peak_reports_nothing_discarded() {
+        let guard = EquityGuard::new();
+        assert_eq!(guard.reset_peak(50.0), Ok(None));
+        assert_eq!(guard.state_snapshot()["peakEquity"], 50.0);
+    }
+
     fn state_with_audit() -> (
         crate::AppState,
         std::sync::Arc<crate::broker::EaLink>,
@@ -944,5 +1116,115 @@ mod tests {
         assert_eq!(payload["discardedPeakEquity"], 10_000.0);
         assert_eq!(payload["newEquity"], 100.0);
         assert!(!payload.to_string().contains("token"), "no secrets");
+    }
+
+    #[actix_web::test]
+    async fn resetting_the_peak_ends_the_pause_and_audits_the_discarded_peak() {
+        let (state, link, trail) = state_with_audit();
+        let big = account(94_168, "IFCMarkets-Demo");
+        link.retain_snapshot_from(payload(100.0), big.clone());
+        observe_account(
+            &state,
+            &link.last_account().expect("account"),
+            SystemTime::now(),
+        );
+        link.retain_snapshot_from(payload(60.0), big);
+        let paused = observe_account(
+            &state,
+            &link.last_account().expect("account"),
+            SystemTime::now(),
+        );
+        assert!((paused.peak_percent - 40.0).abs() < 1e-9);
+
+        let reset = reset_peak(&state).await.expect("reset accepted");
+        assert_eq!(reset.discarded_peak_equity, Some(100.0));
+        assert_eq!(reset.peak_equity, 60.0);
+        let after = observe_account(
+            &state,
+            &link.last_account().expect("account"),
+            SystemTime::now(),
+        );
+        assert_eq!(after.peak_percent, 0.0);
+
+        let recorded: Vec<_> = trail
+            .events()
+            .into_iter()
+            .filter(|event| event.kind() == crate::audit::AuditKind::PeakReset)
+            .collect();
+        assert_eq!(recorded.len(), 1);
+        let payload = recorded[0].payload();
+        assert_eq!(payload["discardedPeakEquity"], 100.0);
+        assert_eq!(payload["peakEquity"], 60.0);
+        assert_eq!(payload["accountLogin"], 94_168);
+        assert!(!payload.to_string().contains("token"), "no secrets");
+    }
+
+    #[actix_web::test]
+    async fn resetting_the_peak_without_an_account_reading_is_refused_and_unrecorded() {
+        let (state, _link, trail) = state_with_audit();
+        assert_eq!(
+            reset_peak(&state).await,
+            Err(PeakResetError::AccountUnavailable)
+        );
+        assert!(
+            trail
+                .events()
+                .iter()
+                .all(|event| event.kind() != crate::audit::AuditKind::PeakReset)
+        );
+    }
+
+    #[actix_web::test]
+    async fn resetting_the_peak_is_refused_while_a_fixed_reference_is_set() {
+        let (state, link, trail) = state_with_audit();
+        link.retain_snapshot_from(payload(60.0), account(94_168, "IFCMarkets-Demo"));
+        let policy = state.risk().policy();
+        let patch = crate::risk::RiskPolicyPatch {
+            drawdown_reference: Some(100.0),
+            ..Default::default()
+        };
+        state
+            .risk()
+            .update_policy(policy.apply_patch(&patch).expect("valid patch"));
+        assert_eq!(
+            reset_peak(&state).await,
+            Err(PeakResetError::FixedReference)
+        );
+        assert!(
+            trail
+                .events()
+                .iter()
+                .all(|event| event.kind() != crate::audit::AuditKind::PeakReset)
+        );
+    }
+
+    #[actix_web::test]
+    async fn the_reset_route_answers_with_the_peaks_and_refuses_without_a_reading() {
+        let (state, link, _trail) = state_with_audit();
+        let app = actix_web::test::init_service(crate::app::create_app(state.clone())).await;
+        let call = || {
+            actix_web::test::TestRequest::post()
+                .uri("/risk/peak/reset")
+                .to_request()
+        };
+
+        let refused = actix_web::test::call_service(&app, call()).await;
+        assert_eq!(refused.status(), 503);
+        let body: serde_json::Value = actix_web::test::read_body_json(refused).await;
+        assert_eq!(body["error"], "account_unavailable");
+
+        let login = account(94_168, "IFCMarkets-Demo");
+        link.retain_snapshot_from(payload(100.0), login.clone());
+        observe_account(
+            &state,
+            &link.last_account().expect("account"),
+            SystemTime::now(),
+        );
+        link.retain_snapshot_from(payload(60.0), login);
+        let accepted = actix_web::test::call_service(&app, call()).await;
+        assert_eq!(accepted.status(), 200);
+        let body: serde_json::Value = actix_web::test::read_body_json(accepted).await;
+        assert_eq!(body["discardedPeakEquity"], 100.0);
+        assert_eq!(body["peakEquity"], 60.0);
     }
 }

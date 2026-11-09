@@ -971,16 +971,22 @@ export function RiskPanel({
   policy,
   status,
   onApply,
+  onResetPeak,
 }: {
   policy?: RiskPolicy
   status?: Status
   /** Applies a patch; resolves to an error message or undefined on success. */
   onApply?: (patch: RiskPolicyPatch) => Promise<string | undefined>
+  /** Restarts the highest-equity baseline at the current equity; resolves to an error message or undefined on success. */
+  onResetPeak?: () => Promise<string | undefined>
 }) {
   // An open draft is the editor; there is no separate editing flag to drift.
   const [draft, setDraft] = useState<PolicyDraft>()
   const [error, setError] = useState<string>()
   const [saving, setSaving] = useState(false)
+  // Resetting the peak loosens the brake, so it takes a second, explicit click.
+  const [confirmingReset, setConfirmingReset] = useState(false)
+  const [resetting, setResetting] = useState(false)
 
   const startEditing = (current: RiskPolicy) => {
     setDraft(draftFromPolicy(current))
@@ -1015,6 +1021,15 @@ export function RiskPanel({
     } else {
       setDraft(undefined)
     }
+  }
+
+  const resetPeak = async (reset: () => Promise<string | undefined>) => {
+    setResetting(true)
+    setError(undefined)
+    const failure = await reset()
+    setResetting(false)
+    setConfirmingReset(false)
+    if (failure) setError(failure)
   }
 
   if (draft && onApply) {
@@ -1132,6 +1147,8 @@ export function RiskPanel({
   const known = policy !== undefined
   const view = (text: (current: RiskPolicy) => string) => (policy ? text(policy) : undefined)
   const offOr = (active: boolean, text: string) => (active ? text : 'Off')
+  // Only a peak brake measured from the highest equity has a peak to reset.
+  const canResetPeak = known && onResetPeak !== undefined && policy.maxPeakDrawdownPercent > 0 && !((policy.drawdownReference ?? 0) > 0)
   return (
     <Panel
       title="Risk policy"
@@ -1140,11 +1157,34 @@ export function RiskPanel({
         known ? (
           <>
             {policy.killSwitch ? <State tone="bad">Kill switch on</State> : <State tone="ok">Gate active</State>}
+            {canResetPeak && confirmingReset ? (
+              <>
+                <Button onClick={() => void resetPeak(onResetPeak)} disabled={resetting}>
+                  {resetting ? 'Resetting…' : 'Confirm reset'}
+                </Button>
+                <Button onClick={() => setConfirmingReset(false)} disabled={resetting}>
+                  Cancel
+                </Button>
+              </>
+            ) : canResetPeak ? (
+              <Button onClick={() => setConfirmingReset(true)}>Reset peak</Button>
+            ) : null}
             {onApply ? <Button onClick={() => startEditing(policy)}>Edit</Button> : null}
           </>
         ) : null
       }
     >
+      {error ? (
+        <p className="tab-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+      {confirmingReset ? (
+        <p className="tab-group-note">
+          Restarts the peak at the account's current equity, so new trades resume now and the peak brake counts losses from here. The
+          losses so far are accepted, not undone. Recorded in the audit trail.
+        </p>
+      ) : null}
       <Fields columns={3}>
         <Field
           label="Symbols"

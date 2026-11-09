@@ -245,6 +245,21 @@ describe('api', () => {
     })
   })
 
+  it('posts a peak reset and surfaces the service reason when it is refused', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ discardedPeakEquity: 49.7, peakEquity: 33.6 }))
+      .mockResolvedValueOnce(
+        jsonResponse({ error: 'account_unavailable', reason: 'No fresh account reading from the terminal.' }, 503),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.resetPeak()).resolves.toEqual({ discardedPeakEquity: 49.7, peakEquity: 33.6 })
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/risk/peak/reset')
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ method: 'POST', body: '{}' })
+    await expect(api.resetPeak()).rejects.toThrow('No fresh account reading from the terminal.')
+  })
+
   it('surfaces the field and reason of a rejected patch', async () => {
     vi.stubGlobal(
       'fetch',

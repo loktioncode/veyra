@@ -736,6 +736,54 @@ describe('RiskPanel', () => {
   })
 })
 
+describe('RiskPanel peak reset', () => {
+  it('needs a second click, then resets and leaves the policy untouched', async () => {
+    const onResetPeak = vi.fn().mockResolvedValue(undefined)
+    const onApply = vi.fn()
+    render(<RiskPanel policy={status.risk_policy} status={status} onApply={onApply} onResetPeak={onResetPeak} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
+    expect(onResetPeak).not.toHaveBeenCalled()
+    expect(screen.getByText(/losses so far are accepted/)).toBeTruthy()
+
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' })))
+    expect(onResetPeak).toHaveBeenCalledTimes(1)
+    expect(onApply).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Reset peak' })).toBeTruthy()
+  })
+
+  it('cancels without resetting', () => {
+    const onResetPeak = vi.fn()
+    render(<RiskPanel policy={status.risk_policy} status={status} onResetPeak={onResetPeak} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(onResetPeak).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Reset peak' })).toBeTruthy()
+  })
+
+  it('shows the reason when the service refuses', async () => {
+    const onResetPeak = vi.fn().mockResolvedValue('No fresh account reading from the terminal.')
+    render(<RiskPanel policy={status.risk_policy} status={status} onResetPeak={onResetPeak} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Reset peak' }))
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Confirm reset' })))
+    expect(screen.getByRole('alert').textContent).toContain('No fresh account reading')
+  })
+
+  it('is not offered when the peak brake is off or measures from a fixed reference', () => {
+    const onResetPeak = vi.fn()
+    const { rerender } = render(
+      <RiskPanel policy={{ ...status.risk_policy, maxPeakDrawdownPercent: 0 }} status={status} onResetPeak={onResetPeak} />,
+    )
+    expect(screen.queryByRole('button', { name: 'Reset peak' })).toBeNull()
+    rerender(
+      <RiskPanel policy={{ ...status.risk_policy, drawdownReference: 10000 }} status={status} onResetPeak={onResetPeak} />,
+    )
+    expect(screen.queryByRole('button', { name: 'Reset peak' })).toBeNull()
+    rerender(<RiskPanel policy={status.risk_policy} status={status} />)
+    expect(screen.queryByRole('button', { name: 'Reset peak' })).toBeNull()
+  })
+})
+
 describe('RiskPanel editing', () => {
   it('applies a patched policy and leaves edit mode', async () => {
     const pending = deferred<string | undefined>()

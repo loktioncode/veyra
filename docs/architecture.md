@@ -202,6 +202,7 @@ One append-only PostgreSQL table (`audit_events`: id, timestamp, kind, JSONB pay
 | `failure` | A panic, or an error that would otherwise exist only in the in-memory log ring |
 | `risk_policy_updated` | The live risk policy was replaced from the control surface (full resulting policy attached) |
 | `account_changed` | The terminal moved to a different account (number and server) and the drawdown baselines were reset (old and new account, discarded peak equity, new equity) |
+| `peak_reset` | An operator reset the highest-equity baseline to the current equity from the control surface (`POST /risk/peak/reset`); carries the discarded peak, the new peak and the account |
 | `runtime_config_updated` | One or more live settings were changed from the control surface (changed names and the resulting overlay attached) |
 | `proposal_evaluated` | Every autopilot decision attempt (`outcome`: `no_trade`, `rejected`, `approved_dry_run`, `queued`, `unavailable`, `held`, `close_queued`, `close_rejected`, `stop_rejected`, `break_even`, `trailing_stop`, …). Entry and review decisions carry the model's `rationale` and, when a judge is configured, the chosen asset's `judgements`, so the why is queryable next to the what |
 | `reconciliation_drift` | A snapshot shows orders Veyra does not own, or a truncated position list |

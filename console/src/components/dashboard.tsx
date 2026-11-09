@@ -149,6 +149,17 @@ export function Dashboard() {
     }
   }
 
+  const resetPeak = async () => {
+    try {
+      await api.resetPeak()
+      // The pause lifts on the next reading; refresh so the banner clears now.
+      void refetchStatus()
+      return undefined
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+
   // A manual close goes through the service's single close path: Veyra-owned
   // tickets only, refused while trading is off, re-validated by the terminal.
   const closePosition = async (ticket: number) => {
@@ -308,7 +319,7 @@ export function Dashboard() {
 
           {tab === 'risk' ? (
             <div className="tab-stack">
-              <RiskPanel policy={status?.risk_policy} status={status} onApply={applyPatch} />
+              <RiskPanel policy={status?.risk_policy} status={status} onApply={applyPatch} onResetPeak={resetPeak} />
               <div className="tab-grid">
                 <AccountPanel account={account} error={accountError} />
                 <SessionPanel sessions={sessions} account={account} />
